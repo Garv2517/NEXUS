@@ -1,0 +1,39 @@
+# ==============================================================================
+# NEXUS - Autonomous Text-to-SQL Pipeline Dependencies
+# Architecture Target: Production / High-Reliability Local Pipeline (Python 3.13)
+# ==============================================================================
+
+# Data Processing & Vectorized Operations
+pandas>=2.2.0
+
+# LLM & Text-to-SQL Orchestration
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-core>=0.2.0
+
+# SQL AST Parsing & Security Analysis
+sqlparse>=0.5.0
+
+# Database Interface (LangChain SQLDatabase engine abstraction)
+SQLAlchemy>=2.0.30
+
+# Production-Grade Structured Logging
+loguru>=0.7.2
+
+# Environment & Schema Validation
+pydantic>=2.7.0
+python-dotenv>=1.0.1
+
+# GUI Desktop Interface & Modern Theming (Phase 2 Target)
+customtkinter>=5.2.2
+packaging>=23.2
+
+# Data Visualization & Embedded Dark-Mode Analytics Charts (Phase 4 Target)
+matplotlib>=3.9.0
+
+# NOTE ON sqlite3:
+# 'sqlite3' is built into Python's Standard Library (compiled with C sqlite3).
+# Do NOT attempt to install 'sqlite3' via pip (dummy package / broken).
+# For Linux environments requiring modern SQLite extensions (e.g. ChromaDB),
+# uncomment the binary backport:
+# pysqlite3-binary>=0.5.3

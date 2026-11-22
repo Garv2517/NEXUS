@@ -1,0 +1,88 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Pytest / Test coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local database runtime files (keep schema/fixtures, ignore live WAL/locks)
+data/database/*.db-journal
+data/database/*.db-wal
+data/database/*.db-shm
+
+# Environment & Secrets (RAM-only, zero persistent leakage)
+.env
+.env.local
+.env.*.local
+
+# IDEs & OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# Local AI IDE tooling & runtime SQLite DB
+.agent/
+.agents/
+data/database/*.db*
+
+
+# Local GSD / IDE harness files
+.gemini/
+.gsd/
+adapters/
+GSD-STYLE.md
+PROJECT_RULES.md
+model_capabilities.yaml
+scripts/search_repo.*
+scripts/setup_search.*
+scripts/validate-*
+
+
+# Local GSD / IDE harness files
+.gemini/
+.gsd/
+adapters/
+GSD-STYLE.md
+PROJECT_RULES.md
+model_capabilities.yaml
+scripts/search_repo.*
+scripts/setup_search.*
+scripts/validate-*
+*.zip
+
+
+# Local GSD / IDE harness files & release archives
+.gemini/
+.gsd/
+adapters/
+GSD-STYLE.md
+PROJECT_RULES.md
+model_capabilities.yaml
+scripts/search_repo.*
+scripts/setup_search.*
+scripts/validate-*
+*.zip
+
