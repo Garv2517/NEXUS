@@ -11,10 +11,14 @@
     Purges existing 'build' and 'dist' artifacts prior to compilation.
 .PARAMETER SmokeTest
     Immediately executes the compiled binary with '--smoke-test' to verify runtime integrity.
+.PARAMETER BuildInstaller
+    Compiles an Inno Setup 6 Windows desktop installer (NEXUS-Setup-v1.0.0.exe).
 .EXAMPLE
     .\scripts\build_exe.ps1 -Mode onedir -SmokeTest
 .EXAMPLE
     .\scripts\build_exe.ps1 -Mode onefile -Clean -SmokeTest
+.EXAMPLE
+    .\scripts\build_exe.ps1 -BuildInstaller
 #>
 
 [CmdletBinding()]
@@ -24,7 +28,9 @@ param (
 
     [switch]$Clean,
 
-    [switch]$SmokeTest = $true
+    [switch]$SmokeTest = $true,
+
+    [switch]$BuildInstaller
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,8 +38,35 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 Write-Host "=====================================================================" -ForegroundColor Cyan
 Write-Host " NEXUS STANDALONE EXECUTABLE BUILD PIPELINE" -ForegroundColor Cyan
-Write-Host " Target Mode: $Mode | Clean: $Clean | SmokeTest: $SmokeTest" -ForegroundColor Cyan
+Write-Host " Target Mode: $Mode | Clean: $Clean | SmokeTest: $SmokeTest | BuildInstaller: $BuildInstaller" -ForegroundColor Cyan
 Write-Host "=====================================================================" -ForegroundColor Cyan
+
+# Helper: Locate Inno Setup Compiler
+function Get-InnoSetupCompiler {
+    # 1. Check PATH
+    $cmd = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    # 2. Check standard Program Files (x86)
+    if (${env:ProgramFiles(x86)}) {
+        $candidate = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+        if (Test-Path $candidate) { return $candidate }
+    }
+
+    # 3. Check Local AppData (per-user / winget standard)
+    if (${env:LOCALAPPDATA}) {
+        $candidate = Join-Path ${env:LOCALAPPDATA} "Programs\Inno Setup 6\ISCC.exe"
+        if (Test-Path $candidate) { return $candidate }
+    }
+
+    # 4. Check standard Program Files (64-bit)
+    if ($env:ProgramFiles) {
+        $candidate = Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe"
+        if (Test-Path $candidate) { return $candidate }
+    }
+
+    return $null
+}
 
 # 1. Verify Prerequisites
 $pythonCmd = "python"
@@ -52,6 +85,23 @@ if ($LASTEXITCODE -ne 0) {
     $pyinstallerCheck = & $pythonCmd -m PyInstaller --version
 }
 Write-Host "[OK] PyInstaller Version: $pyinstallerCheck" -ForegroundColor Green
+
+$isccPath = $null
+if ($BuildInstaller) {
+    $isccPath = Get-InnoSetupCompiler
+    if (-not $isccPath) {
+        Write-Host "`n=====================================================================" -ForegroundColor Yellow
+        Write-Host " [!] INNO SETUP 6 COMPILER (ISCC.EXE) NOT DETECTED" -ForegroundColor Yellow
+        Write-Host "=====================================================================" -ForegroundColor Yellow
+        Write-Host "The -BuildInstaller switch requires Inno Setup 6 to compile the Windows installer." -ForegroundColor Yellow
+        Write-Host "`nPlease install Inno Setup 6 by running:" -ForegroundColor White
+        Write-Host "  winget install JRSoftware.InnoSetup" -ForegroundColor Cyan
+        Write-Host "`nExiting build cleanly." -ForegroundColor Yellow
+        Write-Host "=====================================================================" -ForegroundColor Yellow
+        exit 0
+    }
+    Write-Host "[OK] Inno Setup Compiler: $isccPath" -ForegroundColor Green
+}
 
 # 2. Clean Workspace if requested
 if ($Clean) {
@@ -125,9 +175,66 @@ if ($SmokeTest) {
     }
 }
 
+# 8. Inno Setup Windows Installer Compilation
+$installerPath = $null
+$installerSizeMB = 0
+if ($BuildInstaller) {
+    Write-Host "`n=====================================================================" -ForegroundColor Cyan
+    Write-Host " INNO SETUP 6 WINDOWS INSTALLER COMPILATION" -ForegroundColor Cyan
+    Write-Host "=====================================================================" -ForegroundColor Cyan
+
+    if (-not $isccPath) {
+        $isccPath = Get-InnoSetupCompiler
+    }
+
+    if (-not $isccPath) {
+        Write-Host "[!] Inno Setup compiler (ISCC.exe) was not found." -ForegroundColor Yellow
+        Write-Host "    Install Inno Setup 6 via: winget install JRSoftware.InnoSetup" -ForegroundColor Cyan
+        Write-Host "    Exiting installer compilation cleanly." -ForegroundColor Yellow
+        exit 0
+    }
+
+    $issPath = Join-Path $PSScriptRoot "..\installer\nexus_setup.iss"
+    $issPath = [System.IO.Path]::GetFullPath($issPath)
+
+    if (-not (Test-Path $issPath)) {
+        Write-Error "Inno Setup script not found at: $issPath"
+        exit 1
+    }
+
+    Write-Host "[*] Compiling installer: $issPath" -ForegroundColor Cyan
+    Write-Host "[*] Compiler: $isccPath" -ForegroundColor Gray
+    $installerStart = [System.Diagnostics.Stopwatch]::StartNew()
+
+    & $isccPath $issPath
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Inno Setup compilation failed with exit code $LASTEXITCODE"
+        exit $LASTEXITCODE
+    }
+
+    $installerStart.Stop()
+
+    $installerPath = Join-Path $PSScriptRoot "..\dist\installer\NEXUS-Setup-v1.0.0.exe"
+    $installerPath = [System.IO.Path]::GetFullPath($installerPath)
+
+    if (-not (Test-Path $installerPath)) {
+        Write-Error "Expected installer binary not found at: $installerPath"
+        exit 1
+    }
+
+    $installerSizeMB = (Get-Item $installerPath).Length / 1MB
+    Write-Host "[OK] Inno Setup Installer: $installerPath" -ForegroundColor Green
+    Write-Host "[OK] NEXUS-Setup-v1.0.0.exe Size: $($installerSizeMB.ToString('F2')) MB" -ForegroundColor Green
+    Write-Host "[OK] Installer compiled in $($installerStart.Elapsed.TotalSeconds.ToString('F2')) seconds." -ForegroundColor Green
+}
+
 $sw.Stop()
 Write-Host "`n=====================================================================" -ForegroundColor Green
 Write-Host " NEXUS BUILD SUCCESSFUL - Total Time: $($sw.Elapsed.TotalSeconds.ToString('F2'))s" -ForegroundColor Green
 Write-Host " Binary Ready at: $exePath" -ForegroundColor Green
+if ($BuildInstaller -and $installerPath -and (Test-Path $installerPath)) {
+    Write-Host " Installer Ready at: $installerPath ($($installerSizeMB.ToString('F2')) MB)" -ForegroundColor Green
+}
 Write-Host "=====================================================================" -ForegroundColor Green
 exit 0

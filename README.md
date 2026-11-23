@@ -315,11 +315,23 @@ All performance benchmarks and execution timing were validated on the following 
 
 ## Installation, Build & CLI Reference
 
+### Download & Install (Windows — No Python or Terminal Required)
+
+1. Go to the **Releases** page on the right and download **`NEXUS-Setup-v1.0.0.exe`**.
+2. Double-click **`NEXUS-Setup-v1.0.0.exe`** and follow the setup wizard.
+3. Launch **NEXUS** from your Desktop or Start Menu.
+
+> **Optional Note**: For offline local AI, install Ollama from [ollama.com](https://ollama.com); CSV ingestion, SQL Explorer, Telemetry HUD, and Cloud Gemini/Claude mode work immediately with zero extra setup.
+
+<details>
+<summary>Developer Setup & Build from Source (Optional)</summary>
+
+<br>
+
 ### 1. Developer Setup (Run from Source)
 
 ```powershell
-# Clone the repository
-git clone https://github.com/your-org/nexus.git
+# Navigate into the repository root
 cd nexus_project
 
 # Create and activate virtual environment
@@ -333,7 +345,7 @@ pip install -r requirements.txt
 python -m pytest
 ```
 
-### 2. Standalone Binary Compilation
+### 2. Standalone Binary & Installer Compilation
 
 NEXUS includes an automated PowerShell build pipeline (`scripts/build_exe.ps1`):
 
@@ -343,6 +355,9 @@ NEXUS includes an automated PowerShell build pipeline (`scripts/build_exe.ps1`):
 
 # Clean previous builds and compile single-file portable binary (dist\NEXUS.exe)
 .\scripts\build_exe.ps1 -Mode onefile -Clean -SmokeTest
+
+# Build standalone executable AND Inno Setup Windows installer (dist\installer\NEXUS-Setup-v1.0.0.exe)
+.\scripts\build_exe.ps1 -BuildInstaller
 ```
 
 ### 3. Command Line Interface (CLI) Arguments
@@ -357,6 +372,8 @@ NEXUS includes an automated PowerShell build pipeline (`scripts/build_exe.ps1`):
 # Execute non-interactive headless smoke test (exits 0 with NEXUS_SMOKE_TEST_OK)
 .\dist\NEXUS\NEXUS.exe --smoke-test
 ```
+
+</details>
 
 ---
 
