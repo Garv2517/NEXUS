@@ -120,12 +120,20 @@ def configure_windows_dpi_awareness() -> None:
     """
     Enforces per-monitor DPI scaling on Windows to ensure razor-sharp typography
     and eliminate pixelated GUI scaling artifacts on 4K/high-density monitors.
+    Also expands CRT maximum stdio file handle limits to 2048 to prevent Tcl file
+    descriptor exhaustion during long desktop operator sessions and high-throughput pipelines.
     """
     if sys.platform != "win32":
         return
 
     try:
         import ctypes
+        for lib in ("ucrtbase.dll", "msvcrt.dll"):
+            try:
+                crt = ctypes.CDLL(lib)
+                crt._setmaxstdio(2048)
+            except Exception:
+                pass
         # Try Per-Monitor DPI Aware V2 (PROCESS_PER_MONITOR_DPI_AWARE = 2)
         # Fallback to System DPI Aware (PROCESS_SYSTEM_DPI_AWARE = 1)
         try:

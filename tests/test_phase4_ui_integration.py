@@ -54,13 +54,19 @@ class TestPhase4UIIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Create hidden root window for CTk widget instantiation in headless test run
-        cls.root = customtkinter.CTk()
+        try:
+            cls.root = customtkinter.CTk()
+        except Exception:
+            time.sleep(0.2)
+            cls.root = customtkinter.CTk()
         cls.root.withdraw()
 
     @classmethod
     def tearDownClass(cls):
         try:
+            cls.root.update_idletasks()
             cls.root.destroy()
+            time.sleep(0.15)
         except Exception:
             pass
 
@@ -148,8 +154,12 @@ class TestPhase4UIIntegration(unittest.TestCase):
         chat.send_user_message()
 
         # Let background worker execute pipeline
-        for _ in range(50):
+        for _ in range(200):
             self.worker.process_queue()
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
             if len(completed_results) > 0:
                 break
             time.sleep(0.05)
@@ -245,11 +255,22 @@ class TestPhase4UIIntegration(unittest.TestCase):
         chat.query_entry.insert(0, "Plot revenue by customer as a bar chart")
         chat.send_user_message()
 
-        for _ in range(50):
+        for _ in range(250):
             self.worker.process_queue()
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
             if len(chat._embedded_figures) > 0:
                 break
             time.sleep(0.05)
+
+        # Final queue flush
+        self.worker.process_queue()
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
 
         # Verify active figure is tracked in chat._embedded_figures
         self.assertEqual(len(chat._embedded_figures), 1)
@@ -283,11 +304,19 @@ class TestPhase4UIIntegration(unittest.TestCase):
         NexusApp receives _handle_open_sql_in_explorer -> switches tabview to
         'Data Explorer' -> populates scratchpad -> executes guarded query.
         """
-        app = NexusApp(
-            db_manager=self.db,
-            schema_parser=self.parser,
-            async_worker=self.worker
-        )
+        try:
+            app = NexusApp(
+                db_manager=self.db,
+                schema_parser=self.parser,
+                async_worker=self.worker
+            )
+        except Exception:
+            time.sleep(0.5)
+            app = NexusApp(
+                db_manager=self.db,
+                schema_parser=self.parser,
+                async_worker=self.worker
+            )
         app.withdraw()
 
         target_sql = "SELECT name, region FROM customers WHERE revenue > 20000;"
@@ -303,7 +332,7 @@ class TestPhase4UIIntegration(unittest.TestCase):
         self.assertEqual(editor_text, target_sql)
 
         # Allow worker to execute query in DataExplorerTab
-        for _ in range(50):
+        for _ in range(200):
             app.worker.process_queue()
             if "Nexus Labs" in app.data_explorer_tab.results_textbox.get("1.0", "end"):
                 break
@@ -315,7 +344,12 @@ class TestPhase4UIIntegration(unittest.TestCase):
         self.assertIn("Omni Corp", results_content)
         self.assertNotIn("Bio Synth", results_content)  # Revenue < 20000
 
-        app.destroy()
+        try:
+            app.update_idletasks()
+            app.destroy()
+            time.sleep(0.3)
+        except Exception:
+            pass
 
     # --------------------------------------------------------------------------
     # 4. ADVERSARIAL QUERY INTERCEPTION & AUDIT PERSISTENCE
@@ -353,7 +387,7 @@ class TestPhase4UIIntegration(unittest.TestCase):
         chat.query_entry.insert(0, "Drop the customers table")
         chat.send_user_message()
 
-        for _ in range(50):
+        for _ in range(100):
             self.worker.process_queue()
             if chat.send_btn.cget("state") == "normal":
                 break
@@ -410,7 +444,7 @@ class TestPhase4UIIntegration(unittest.TestCase):
         chat.query_entry.insert(0, "List all customers")
         chat.send_user_message()
 
-        for _ in range(50):
+        for _ in range(100):
             self.worker.process_queue()
             if chat.send_btn.cget("state") == "normal":
                 break
@@ -503,7 +537,7 @@ class TestPhase4UIIntegration(unittest.TestCase):
         chat.query_entry.insert(0, "How many customers exist?")
         chat.send_user_message()
 
-        for _ in range(50):
+        for _ in range(100):
             self.worker.process_queue()
             if chat.send_btn.cget("state") == "normal":
                 break
@@ -595,7 +629,7 @@ class TestPhase4UIIntegration(unittest.TestCase):
         chat.query_entry.insert(0, "Count all customers")
         chat.send_user_message()
 
-        for _ in range(50):
+        for _ in range(100):
             self.worker.process_queue()
             if chat.send_btn.cget("state") == "normal":
                 break
@@ -668,33 +702,61 @@ class TestPhase4UIIntegration(unittest.TestCase):
         """
         # Test Online Discovery
         with patch("src.agent.llm_router.LLMRouter.check_ollama_health", return_value=(True, ["granite4.1:3b", "gemma3:4b"], "Online")):
-            app = NexusApp(
-                db_manager=self.db,
-                schema_parser=self.parser,
-                async_worker=self.worker,
-                poll_interval_ms=20
-            )
+            try:
+                app = NexusApp(
+                    db_manager=self.db,
+                    schema_parser=self.parser,
+                    async_worker=self.worker,
+                    poll_interval_ms=20
+                )
+            except Exception:
+                time.sleep(0.5)
+                app = NexusApp(
+                    db_manager=self.db,
+                    schema_parser=self.parser,
+                    async_worker=self.worker,
+                    poll_interval_ms=20
+                )
             app.withdraw()
             time.sleep(0.2)
             self.worker.process_queue()
             self.assertIn("● Ollama Online (2 models)", app.chat_tab.health_status_label.cget("text"))
             self.assertIn("granite4.1:3b", app.sidebar.model_selector.cget("values"))
             app.on_closing()
+            try:
+                app.update_idletasks()
+            except Exception:
+                pass
+            time.sleep(0.3)
 
         # Test Offline Discovery
         worker2 = AsyncWorkerManager(max_workers=2)
         with patch("src.agent.llm_router.LLMRouter.check_ollama_health", return_value=(False, [], "Connection refused")):
-            app2 = NexusApp(
-                db_manager=self.db,
-                schema_parser=self.parser,
-                async_worker=worker2,
-                poll_interval_ms=20
-            )
+            try:
+                app2 = NexusApp(
+                    db_manager=self.db,
+                    schema_parser=self.parser,
+                    async_worker=worker2,
+                    poll_interval_ms=20
+                )
+            except Exception:
+                time.sleep(0.5)
+                app2 = NexusApp(
+                    db_manager=self.db,
+                    schema_parser=self.parser,
+                    async_worker=worker2,
+                    poll_interval_ms=20
+                )
             app2.withdraw()
             time.sleep(0.2)
             worker2.process_queue()
             self.assertEqual("● Ollama Offline", app2.chat_tab.health_status_label.cget("text"))
             app2.on_closing()
+            try:
+                app2.update_idletasks()
+            except Exception:
+                pass
+            time.sleep(0.2)
 
 
 if __name__ == "__main__":

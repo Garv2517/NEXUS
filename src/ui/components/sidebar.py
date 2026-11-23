@@ -30,6 +30,7 @@ except ImportError:
     logger = logging.getLogger("NEXUS-Sidebar")  # type: ignore
 
 from src.core.db_manager import DatabaseManager
+from src.core.key_vault import WindowsDPAPIVault
 from src.core.schema_parser import SchemaParser, default_parser
 from src.ui.async_worker import AsyncWorkerManager
 from src.ui.theme import NexusTheme, mask_secret
@@ -58,7 +59,10 @@ class SidebarPanel(customtkinter.CTkFrame):
         on_file_selected: Optional[Callable[[str], None]] = None,
         on_table_selected: Optional[Callable[[str], None]] = None,
         on_llm_config_changed: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_rename_table: Optional[Callable[[str, str], None]] = None,
+        on_drop_table: Optional[Callable[[str], None]] = None,
         width: int = 300,
+        key_vault: Optional[WindowsDPAPIVault] = None,
         **kwargs: Any
     ) -> None:
         worker = async_worker or kwargs.pop("worker_manager", None)
@@ -78,11 +82,16 @@ class SidebarPanel(customtkinter.CTkFrame):
         self.on_file_selected = on_file_selected
         self.on_table_selected = on_table_selected
         self.on_llm_config_changed = on_llm_config_changed
+        self.on_rename_table = on_rename_table
+        self.on_drop_table = on_drop_table
+        self._key_vault = key_vault
 
         # Volatile security state: API keys stored in memory only, never written to disk or logged
         self._volatile_api_key: Optional[str] = None
         self._selected_file_path: Optional[str] = None
         self._active_provider: str = "local"  # "local" or "cloud"
+        self._selected_table: Optional[str] = None
+        self._table_buttons: Dict[str, customtkinter.CTkButton] = {}
 
         self._build_ui()
 
@@ -193,6 +202,20 @@ class SidebarPanel(customtkinter.CTkFrame):
         )
         self.select_file_btn.pack(fill="x", padx=NexusTheme.PADDING_SM, pady=4)
 
+        # AI Smart Clean Toggle (Default False for 100% backward compatibility)
+        self.ai_clean_var = customtkinter.BooleanVar(value=False)
+        self.ai_clean_switch = customtkinter.CTkSwitch(
+            card,
+            text="🤖 AI Smart Clean",
+            variable=self.ai_clean_var,
+            font=NexusTheme.FONT_SMALL_BOLD,
+            progress_color=NexusTheme.ACCENT_CYAN,
+            button_color=NexusTheme.TEXT_PRIMARY,
+            button_hover_color=NexusTheme.ACCENT_CYAN_HOVER,
+            text_color=NexusTheme.TEXT_PRIMARY,
+        )
+        self.ai_clean_switch.pack(anchor="w", padx=NexusTheme.PADDING_SM, pady=(2, 4))
+
         self.file_label = customtkinter.CTkLabel(
             card,
             text="No file selected",
@@ -259,6 +282,47 @@ class SidebarPanel(customtkinter.CTkFrame):
             border_color=NexusTheme.SURFACE_BORDER
         )
         self.table_scroll_frame.grid(row=2, column=0, sticky="nsew")
+
+        # Table Management Action Row
+        self.table_action_frame = customtkinter.CTkFrame(inspector_frame, fg_color="transparent")
+        self.table_action_frame.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        self.table_action_frame.grid_columnconfigure(0, weight=1)
+        self.table_action_frame.grid_columnconfigure(1, weight=1)
+
+        self.rename_table_btn = customtkinter.CTkButton(
+            self.table_action_frame,
+            text="✏️ Rename",
+            font=NexusTheme.FONT_SMALL,
+            fg_color=NexusTheme.SURFACE_ELEVATED,
+            hover_color=NexusTheme.ACCENT_CYAN_MUTED,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            state="disabled",
+            height=26,
+            command=self._handle_rename_click
+        )
+        self.rename_table_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+
+        self.drop_table_btn = customtkinter.CTkButton(
+            self.table_action_frame,
+            text="🗑️ Drop",
+            font=NexusTheme.FONT_SMALL,
+            fg_color=NexusTheme.SURFACE_ELEVATED,
+            hover_color=NexusTheme.STATUS_CRIMSON,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            state="disabled",
+            height=26,
+            command=self._handle_drop_click
+        )
+        self.drop_table_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+
+    def _canonical_cloud_provider(self) -> str:
+        """Maps active Cloud provider/model selection cleanly to a canonical lowercase slug ('gemini' or 'claude')."""
+        active_model = (self.model_selector.get() or "").lower() if hasattr(self, "model_selector") else ""
+        if "claude" in active_model or "anthropic" in active_model:
+            return "claude"
+        return "gemini"
 
     def _build_llm_security_toggle(self) -> None:
         llm_frame = customtkinter.CTkFrame(
@@ -328,6 +392,51 @@ class SidebarPanel(customtkinter.CTkFrame):
             command=self._handle_apply_api_key
         )
         self.apply_key_btn.pack(fill="x", pady=2)
+
+        # Opt-in DPAPI Remember Key Checkbox
+        self.remember_key_var = customtkinter.BooleanVar(value=False)
+        vault_supported = (self._key_vault is not None and self._key_vault.is_supported())
+        self.remember_key_checkbox = customtkinter.CTkCheckBox(
+            self.key_container,
+            text="🔒 Remember Key (DPAPI)",
+            variable=self.remember_key_var,
+            command=self._on_remember_key_toggled,
+            font=NexusTheme.FONT_SMALL,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            checkmark_color="#000000",
+            fg_color=NexusTheme.ACCENT_CYAN,
+            hover_color=NexusTheme.ACCENT_CYAN_HOVER,
+            state="normal" if vault_supported else "disabled"
+        )
+        self.remember_key_checkbox.pack(anchor="w", pady=(4, 2))
+
+        # Vault Status Row: Pill and Forget Key Button
+        vault_ctrl_row = customtkinter.CTkFrame(self.key_container, fg_color="transparent")
+        vault_ctrl_row.pack(fill="x", pady=(2, 4))
+        vault_ctrl_row.grid_columnconfigure(0, weight=1)
+
+        self.vault_status_label = customtkinter.CTkLabel(
+            vault_ctrl_row,
+            text="Volatile (RAM-only)",
+            font=NexusTheme.FONT_SMALL,
+            text_color=NexusTheme.TEXT_MUTED,
+            anchor="w"
+        )
+        self.vault_status_label.grid(row=0, column=0, sticky="w")
+
+        self.forget_key_btn = customtkinter.CTkButton(
+            vault_ctrl_row,
+            text="🗑️ Forget Key",
+            font=NexusTheme.FONT_SMALL,
+            width=85,
+            height=24,
+            fg_color=NexusTheme.SURFACE_SLATE,
+            hover_color=NexusTheme.STATUS_CRIMSON,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            command=self.forget_current_provider_key
+        )
+        self.forget_key_btn.grid(row=0, column=1, sticky="e")
 
         # Key Masked Status Indicator
         self.key_status_label = customtkinter.CTkLabel(
@@ -415,8 +524,11 @@ class SidebarPanel(customtkinter.CTkFrame):
         # Clear existing table buttons
         for widget in self.table_scroll_frame.winfo_children():
             widget.destroy()
+        self._table_buttons.clear()
 
         if not table_names:
+            self._selected_table = None
+            self._update_table_action_buttons()
             empty_lbl = customtkinter.CTkLabel(
                 self.table_scroll_frame,
                 text="No user tables found in database.",
@@ -427,20 +539,28 @@ class SidebarPanel(customtkinter.CTkFrame):
             empty_lbl.pack(fill="x", pady=12)
             return
 
+        # If previous selection is no longer valid, clear it
+        if self._selected_table not in table_names:
+            self._selected_table = None
+
         # Populate table buttons
         for name in table_names:
+            is_selected = (name == self._selected_table)
             btn = customtkinter.CTkButton(
                 self.table_scroll_frame,
                 text=f"📊  {name}",
                 font=NexusTheme.FONT_CODE,
                 anchor="w",
-                fg_color="transparent",
+                fg_color=NexusTheme.SURFACE_ELEVATED if is_selected else "transparent",
                 hover_color=NexusTheme.SURFACE_ELEVATED,
-                text_color=NexusTheme.TEXT_PRIMARY,
+                text_color=NexusTheme.ACCENT_CYAN if is_selected else NexusTheme.TEXT_PRIMARY,
                 height=26,
                 command=lambda t=name: self._handle_table_click(t)
             )
             btn.pack(fill="x", padx=2, pady=1)
+            self._table_buttons[name] = btn
+
+        self._update_table_action_buttons()
 
     def _on_schema_refresh_failed(self, error: Exception) -> None:
         if not self.winfo_exists():
@@ -450,14 +570,83 @@ class SidebarPanel(customtkinter.CTkFrame):
             text="Schema reflection failed.",
             text_color=NexusTheme.STATUS_CRIMSON
         )
+        self._update_table_action_buttons()
 
     def _handle_table_click(self, table_name: str) -> None:
         logger.debug(f"Table clicked in schema inspector: {table_name}")
+        self._selected_table = table_name
+        self._update_table_action_buttons()
+
+        for name, btn in self._table_buttons.items():
+            try:
+                if btn.winfo_exists():
+                    if name == table_name:
+                        btn.configure(fg_color=NexusTheme.SURFACE_ELEVATED, text_color=NexusTheme.ACCENT_CYAN)
+                    else:
+                        btn.configure(fg_color="transparent", text_color=NexusTheme.TEXT_PRIMARY)
+            except Exception:
+                pass
+
         if callable(self.on_table_selected):
             try:
                 self.on_table_selected(table_name)
             except Exception as exc:
                 logger.error(f"Error in on_table_selected callback: {exc}")
+
+    @staticmethod
+    def _is_table_protected(table_name: Optional[str]) -> bool:
+        if not table_name:
+            return True
+        lower = table_name.lower().strip()
+        return lower.startswith("_nexus_") or lower.startswith("sqlite_")
+
+    def _update_table_action_buttons(self) -> None:
+        """Enables or disables Rename and Drop buttons based on current table selection."""
+        is_prot = self._is_table_protected(self._selected_table)
+        btn_state = "normal" if (self._selected_table and not is_prot) else "disabled"
+        if hasattr(self, "rename_table_btn") and self.rename_table_btn.winfo_exists():
+            self.rename_table_btn.configure(state=btn_state)
+        if hasattr(self, "drop_table_btn") and self.drop_table_btn.winfo_exists():
+            self.drop_table_btn.configure(state=btn_state)
+
+    def _handle_rename_click(self) -> None:
+        """Prompts user for a new table name and invokes on_rename_table callback."""
+        if not self._selected_table or self._is_table_protected(self._selected_table):
+            return
+        old_name = self._selected_table
+        dialog = customtkinter.CTkInputDialog(
+            text=f"Enter new name for table '{old_name}':",
+            title="Rename Table"
+        )
+        new_name = dialog.get_input()
+        if new_name and new_name.strip():
+            cleaned_new_name = new_name.strip()
+            if callable(self.on_rename_table):
+                try:
+                    self.on_rename_table(old_name, cleaned_new_name)
+                except Exception as exc:
+                    logger.error(f"Error in on_rename_table callback: {exc}")
+
+    def _handle_drop_click(self) -> None:
+        """Prompts user for confirmation and invokes on_drop_table callback."""
+        if not self._selected_table or self._is_table_protected(self._selected_table):
+            return
+        table_name = self._selected_table
+        from tkinter import messagebox
+        confirmed = messagebox.askyesno(
+            title="Confirm Drop Table",
+            message=f"Are you sure you want to permanently drop table '{table_name}'?\nThis action cannot be undone."
+        )
+        if confirmed:
+            if callable(self.on_drop_table):
+                try:
+                    self.on_drop_table(table_name)
+                except Exception as exc:
+                    logger.error(f"Error in on_drop_table callback: {exc}")
+
+    def get_selected_table(self) -> Optional[str]:
+        """Returns the currently selected database table name, or None."""
+        return self._selected_table
 
     def _handle_provider_change(self, value: str) -> None:
         """Toggles between Local Ollama and Cloud API view and models."""
@@ -466,6 +655,7 @@ class SidebarPanel(customtkinter.CTkFrame):
             self.model_selector.configure(values=self.CLOUD_MODELS)
             self.model_selector.set(self.CLOUD_MODELS[0])
             self.key_container.pack(fill="x", padx=NexusTheme.PADDING_SM, pady=4)
+            self.load_key_from_vault_for_provider()
             self._update_key_status_label()
         else:
             self._active_provider = "local"
@@ -480,6 +670,8 @@ class SidebarPanel(customtkinter.CTkFrame):
         self._notify_llm_config_changed()
 
     def _handle_model_change(self, selected_model: str) -> None:
+        if self._active_provider == "cloud":
+            self.load_key_from_vault_for_provider()
         self._notify_llm_config_changed()
 
     def _handle_apply_api_key(self) -> None:
@@ -490,12 +682,112 @@ class SidebarPanel(customtkinter.CTkFrame):
             self._update_key_status_label()
             return
 
-        # Store in volatile instance memory (never written to file or logged)
+        # Store in volatile instance memory (never written to file or logged unless opted into DPAPI)
         self._volatile_api_key = raw_key
-        self.api_key_entry.delete(0, "end")
+        if hasattr(self, "remember_key_var") and self.remember_key_var.get():
+            self.save_current_key_to_vault()
+        else:
+            self.api_key_entry.delete(0, "end")
+            self._update_key_status_label()
+            self._notify_llm_config_changed()
+            logger.info(f"Cloud API key applied to volatile memory: {mask_secret(raw_key)}")
+
+    def _on_remember_key_toggled(self) -> None:
+        """Handles toggling the Remember Key checkbox."""
+        if self.remember_key_var.get():
+            self.save_current_key_to_vault()
+        else:
+            slug = self._canonical_cloud_provider()
+            if self._key_vault is not None:
+                self._key_vault.delete_key(slug)
+            if hasattr(self, "vault_status_label") and self.vault_status_label.winfo_exists():
+                self.vault_status_label.configure(
+                    text="Volatile (RAM-only)",
+                    text_color=NexusTheme.TEXT_MUTED
+                )
+
+    def load_key_from_vault_for_provider(self, provider: Optional[str] = None) -> bool:
+        """
+        Loads and decrypts saved API key from the DPAPI key vault if present.
+        Updates volatile memory, checkbox, status pill, and notifies LLM config listeners.
+        """
+        slug = (provider.strip().lower() if provider else self._canonical_cloud_provider())
+        if "claude" in slug or "anthropic" in slug:
+            slug = "claude"
+        elif "gemini" in slug:
+            slug = "gemini"
+
+        if self._key_vault is not None and self._key_vault.is_supported():
+            saved_key = self._key_vault.load_key(slug, raise_on_corrupt=False)
+            if saved_key:
+                self._volatile_api_key = saved_key
+                if hasattr(self, "api_key_entry") and self.api_key_entry.winfo_exists():
+                    self.api_key_entry.delete(0, "end")
+                    self.api_key_entry.insert(0, saved_key)
+                if hasattr(self, "remember_key_var"):
+                    self.remember_key_var.set(True)
+                if hasattr(self, "vault_status_label") and self.vault_status_label.winfo_exists():
+                    self.vault_status_label.configure(
+                        text="🔒 Key Saved (DPAPI)",
+                        text_color=NexusTheme.STATUS_EMERALD
+                    )
+                self._update_key_status_label()
+                self._notify_llm_config_changed()
+                return True
+
+        if hasattr(self, "remember_key_var"):
+            self.remember_key_var.set(False)
+        if hasattr(self, "vault_status_label") and self.vault_status_label.winfo_exists():
+            self.vault_status_label.configure(
+                text="Volatile (RAM-only)",
+                text_color=NexusTheme.TEXT_MUTED
+            )
+        return False
+
+    def save_current_key_to_vault(self) -> bool:
+        """Saves current raw API key into DPAPI vault for active cloud provider."""
+        slug = self._canonical_cloud_provider()
+        raw_key = self._volatile_api_key
+        if not raw_key and hasattr(self, "api_key_entry") and self.api_key_entry.winfo_exists():
+            raw_key = self.api_key_entry.get().strip()
+
+        if not raw_key:
+            return False
+
+        if self._key_vault is not None and self._key_vault.is_supported():
+            self._key_vault.save_key(slug, raw_key)
+            self._volatile_api_key = raw_key
+            if hasattr(self, "remember_key_var"):
+                self.remember_key_var.set(True)
+            if hasattr(self, "vault_status_label") and self.vault_status_label.winfo_exists():
+                self.vault_status_label.configure(
+                    text="🔒 Key Saved (DPAPI)",
+                    text_color=NexusTheme.STATUS_EMERALD
+                )
+            self._update_key_status_label()
+            self._notify_llm_config_changed()
+            return True
+        return False
+
+    def forget_current_provider_key(self) -> bool:
+        """Deletes key from DPAPI vault, wipes volatile memory, and clears UI entry."""
+        slug = self._canonical_cloud_provider()
+        if self._key_vault is not None:
+            self._key_vault.delete_key(slug)
+
+        self._volatile_api_key = None
+        if hasattr(self, "api_key_entry") and self.api_key_entry.winfo_exists():
+            self.api_key_entry.delete(0, "end")
+        if hasattr(self, "remember_key_var"):
+            self.remember_key_var.set(False)
+        if hasattr(self, "vault_status_label") and self.vault_status_label.winfo_exists():
+            self.vault_status_label.configure(
+                text="Volatile (RAM-only)",
+                text_color=NexusTheme.TEXT_MUTED
+            )
         self._update_key_status_label()
         self._notify_llm_config_changed()
-        logger.info(f"Cloud API key applied to volatile memory: {mask_secret(raw_key)}")
+        return True
 
     def _update_key_status_label(self) -> None:
         if self._volatile_api_key:
@@ -593,3 +885,12 @@ class SidebarPanel(customtkinter.CTkFrame):
     def get_selected_file(self) -> Optional[str]:
         """Alias for get_selected_file_path for full interface compatibility."""
         return self._selected_file_path
+
+    def is_ai_clean_enabled(self) -> bool:
+        """Returns whether AI Smart Clean is enabled for tabular file ingestion."""
+        return bool(self.ai_clean_var.get())
+
+    def set_ai_clean_enabled(self, enabled: bool) -> None:
+        """Sets the AI Smart Clean toggle state."""
+        self.ai_clean_var.set(enabled)
+

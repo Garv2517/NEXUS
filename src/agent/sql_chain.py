@@ -26,7 +26,7 @@ import dataclasses
 import json
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -101,16 +101,25 @@ def extract_sql_from_response(raw_text: str) -> str:
 
 
 # ==============================================================================
-# AGENT RESULT CONTAINER
+# CONVERSATION MEMORY & AGENT CONTAINERS
 # ==============================================================================
+
+@dataclasses.dataclass(frozen=True)
+class ConversationTurn:
+    """Represents a single verified turn in an ongoing analytical conversation."""
+    natural_query: str
+    generated_sql: str
+    answer_summary: str  # compact summary truncated to <= 240 chars
+    tables_used: Tuple[str, ...] = ()
+
 
 @dataclasses.dataclass(frozen=True)
 class AgentRunResult:
     """Immutable record capturing the complete lifecycle of an Agent execution run."""
     natural_query: str
     generated_sql: str
-    query_result: Optional[QueryResult]
-    answer_markdown: str
+    query_result: Optional[QueryResult] = None
+    answer_markdown: str = ""
     chart_spec: Optional[ChartSpec] = None
     status: str = "SUCCESS"  # "SUCCESS", "SECURITY_BLOCKED", "SQL_FAILED", "LLM_ERROR", "EMPTY_DB"
     repair_attempts: int = 0
@@ -119,6 +128,8 @@ class AgentRunResult:
     provider: str = ""
     model: str = ""
     error_message: Optional[str] = None
+    tables_in_context: Tuple[str, ...] = ()
+    was_pruned: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert agent result to a dictionary for telemetry and UI display."""
@@ -135,6 +146,8 @@ class AgentRunResult:
             "provider": self.provider,
             "model": self.model,
             "error_message": self.error_message,
+            "tables_in_context": list(self.tables_in_context),
+            "was_pruned": self.was_pruned,
         }
 
 
@@ -159,27 +172,33 @@ class SQLAgentChain:
         db_manager: DatabaseManager,
         schema_parser: SchemaParser,
         llm_router: LLMRouter,
-        max_repair_attempts: int = 2
+        max_repair_attempts: int = 2,
+        max_schema_tables: int = 8,
+        max_history_turns: int = 4
     ) -> None:
         self.db = db_manager
         self.parser = schema_parser
+        self.schema_parser = schema_parser
         self.router = llm_router
         self.max_repair_attempts = max_repair_attempts
+        self.max_schema_tables = max_schema_tables
+        self.max_history_turns = max_history_turns
 
     def run(
         self,
         natural_query: str,
         include_samples: bool = False,
         request_chart: Optional[bool] = None,
-        progress_callback: Optional[Callable[[str], None]] = None
+        progress_callback: Optional[Callable[[str], None]] = None,
+        conversation_history: Optional[List[ConversationTurn]] = None
     ) -> AgentRunResult:
         """
         Executes the autonomous analytical loop for a natural language inquiry.
 
         Stages:
         1. Empty Database Check (short-circuit).
-        2. Schema Context Assembly.
-        3. Initial SQL Generation via LLM.
+        2. Schema Context Assembly & Pruning.
+        3. Initial SQL Generation via LLM (with bounded conversation memory).
         4. QueryGuard 8-Layer Security Filter (0 retries on violation).
         5. Execution & Bounded Self-Healing Repair Loop.
         6. Executive Insight Generation.
@@ -201,7 +220,9 @@ class SQLAgentChain:
                 status="SQL_FAILED",
                 provider=provider,
                 model=model,
-                error_message="Empty prompt provided"
+                error_message="Empty prompt provided",
+                tables_in_context=(),
+                was_pruned=False
             )
 
         # ----------------------------------------------------------------------
@@ -222,24 +243,66 @@ class SQLAgentChain:
                 ),
                 status="EMPTY_DB",
                 provider=provider,
-                model=model
+                model=model,
+                tables_in_context=(),
+                was_pruned=False
             )
 
         # ----------------------------------------------------------------------
-        # Stage 2: Schema Context Assembly
+        # Stage 2: Schema Context Assembly & Smart Pruning
         # ----------------------------------------------------------------------
         if progress_callback:
             progress_callback("Assembling relational schema context...")
-        schema_markdown = self.parser.generate_markdown(
-            include_samples=include_samples,
-            use_cache=not include_samples
-        )
+
+        all_tables = self.parser.get_table_names()
+        was_pruned = False
+        if len(all_tables) > self.max_schema_tables:
+            was_pruned = True
+            pruning_query = clean_query
+            if conversation_history:
+                last_turn = conversation_history[-1]
+                pruning_query = f"{clean_query} {last_turn.natural_query} {last_turn.generated_sql}"
+
+            selected_tables = self.parser.select_relevant_tables(
+                pruning_query,
+                max_tables=self.max_schema_tables
+            )
+            tables_in_context = tuple(selected_tables)
+            schema_markdown = self.parser.generate_markdown(
+                tables=selected_tables,
+                include_samples=include_samples,
+                use_cache=False
+            )
+        else:
+            tables_in_context = tuple(all_tables)
+            schema_markdown = self.parser.generate_markdown(
+                include_samples=include_samples,
+                use_cache=not include_samples
+            )
 
         # ----------------------------------------------------------------------
         # Stage 3: Initial SQL Synthesis
         # ----------------------------------------------------------------------
         if progress_callback:
             progress_callback(f"Synthesizing SQLite query via {model}...")
+
+        recent_history = (conversation_history or [])[-self.max_history_turns:]
+        history_context = ""
+        if recent_history:
+            history_lines = []
+            start_num = len(conversation_history or []) - len(recent_history) + 1
+            for i, turn in enumerate(recent_history, start=start_num):
+                summary_snip = (turn.answer_summary or "").replace("\n", " ").strip()
+                if len(summary_snip) > 240:
+                    summary_snip = summary_snip[:237] + "..."
+                history_lines.append(
+                    f'Turn {i}: User asked: "{turn.natural_query}" | SQL: "{turn.generated_sql}" | Summary: "{summary_snip}"'
+                )
+            history_context = (
+                "\n\nPREVIOUS CONVERSATION CONTEXT (Most Recent Turns):\n"
+                + "\n".join(history_lines)
+                + "\nUse this history to resolve pronouns, filter refinements, and follow-up aggregations."
+            )
 
         system_instruction = (
             "You are an expert SQLite data analyst and read-only Text-to-SQL engineer.\n"
@@ -250,7 +313,8 @@ class SQLAgentChain:
             "2. NEVER output mutating queries (INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH, PRAGMA, VACUUM, TRUNCATE).\n"
             "3. Always wrap the SQL query inside ```sql ... ``` code fences.\n"
             "4. Return ONLY the SQL query with zero conversational preamble.\n\n"
-            f"DATABASE RELATIONAL SCHEMA:\n{schema_markdown}\n"
+            f"DATABASE RELATIONAL SCHEMA:\n{schema_markdown}"
+            f"{history_context}\n"
         )
 
         messages = [
@@ -274,7 +338,9 @@ class SQLAgentChain:
                 total_latency_ms=total_latency_ms,
                 provider=provider,
                 model=model,
-                error_message=str(llm_err)
+                error_message=str(llm_err),
+                tables_in_context=tables_in_context,
+                was_pruned=was_pruned
             )
 
         raw_sql = extract_sql_from_response(llm_resp.content)
@@ -313,7 +379,9 @@ class SQLAgentChain:
                 total_latency_ms=total_latency_ms,
                 provider=provider,
                 model=model,
-                error_message=str(sec_exc)
+                error_message=str(sec_exc),
+                tables_in_context=tables_in_context,
+                was_pruned=was_pruned
             )
 
         # ----------------------------------------------------------------------
@@ -350,7 +418,9 @@ class SQLAgentChain:
                     total_latency_ms=total_latency_ms,
                     provider=provider,
                     model=model,
-                    error_message=str(ro_exc)
+                    error_message=str(ro_exc),
+                    tables_in_context=tables_in_context,
+                    was_pruned=was_pruned
                 )
 
             except QueryExecutionError as qe_exc:
@@ -401,7 +471,9 @@ class SQLAgentChain:
                             total_latency_ms=total_latency_ms,
                             provider=provider,
                             model=model,
-                            error_message=str(sec_exc)
+                            error_message=str(sec_exc),
+                            tables_in_context=tables_in_context,
+                            was_pruned=was_pruned
                         )
                     continue
 
@@ -419,7 +491,9 @@ class SQLAgentChain:
                     total_latency_ms=total_latency_ms,
                     provider=provider,
                     model=model,
-                    error_message=str(qe_exc)
+                    error_message=str(qe_exc),
+                    tables_in_context=tables_in_context,
+                    was_pruned=was_pruned
                 )
 
         # Log audit event for successful execution
@@ -513,5 +587,117 @@ class SQLAgentChain:
             total_tokens=total_tokens,
             total_latency_ms=total_latency_ms,
             provider=provider,
-            model=model
+            model=model,
+            tables_in_context=tables_in_context,
+            was_pruned=was_pruned
         )
+
+
+# ==============================================================================
+# ZERO-LLM STARTER QUESTION GENERATION
+# ==============================================================================
+
+def generate_starter_questions(schema_parser: SchemaParser, max_questions: int = 3) -> List[str]:
+    """
+    Deterministically generates up to `max_questions` natural, table-specific analytical
+    questions using pure Python heuristics with zero LLM calls.
+
+    Inspects up to the top 3 tables (prioritizing largest row count).
+    Identifies numeric (INTEGER/REAL non-ID), categorical (TEXT), and date/timestamp columns.
+    Emits up to max_questions natural prompts (aggregation + bar chart prompt,
+    time-trend line chart or distribution, top-N ranking).
+    Returns [] cleanly if the database has 0 tables.
+    """
+    table_names = schema_parser.get_table_names()
+    if not table_names:
+        return []
+
+    tables_info = schema_parser.get_schema_info()
+    if not tables_info:
+        return []
+
+    # Sort tables prioritizing largest estimated_rows descending, then name ascending
+    sorted_tables = sorted(tables_info, key=lambda t: (t.estimated_rows, -len(t.name)), reverse=True)
+    top_tables = sorted_tables[:3]
+
+    questions: List[str] = []
+
+    ID_PATTERN = re.compile(r"(^id$|_id$|uuid|guid|key$|^pk_)", re.IGNORECASE)
+    DATE_PATTERN = re.compile(r"(date|time|created|timestamp|updated|period|year|month|day)", re.IGNORECASE)
+
+    for table in top_tables:
+        if len(questions) >= max_questions:
+            break
+
+        numeric_cols: List[str] = []
+        categorical_cols: List[str] = []
+        date_cols: List[str] = []
+
+        for col in table.columns:
+            c_name = col.name
+            c_type = (col.data_type or "").upper()
+
+            # Skip primary keys / ID columns for metrics
+            if col.is_primary_key or ID_PATTERN.search(c_name):
+                continue
+
+            if DATE_PATTERN.search(c_name) or any(t in c_type for t in ("DATE", "TIME", "TIMESTAMP")):
+                date_cols.append(c_name)
+            elif any(t in c_type for t in ("INT", "REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL")):
+                numeric_cols.append(c_name)
+            elif any(t in c_type for t in ("TEXT", "CHAR", "VARCHAR", "CLOB")):
+                categorical_cols.append(c_name)
+
+        t_name = table.name
+
+        # 1. Aggregation + bar chart prompt
+        if numeric_cols and categorical_cols:
+            num = numeric_cols[0]
+            cat = categorical_cols[0]
+            q1 = f"Show a bar chart of total {num} by {cat}"
+            if q1 not in questions:
+                questions.append(q1)
+
+        # 2. Time-trend line chart or distribution prompt
+        if len(questions) < max_questions:
+            if numeric_cols and date_cols:
+                num = numeric_cols[0]
+                dt = date_cols[0]
+                q2 = f"Show monthly trend of {num} over {dt} as a line chart"
+                if q2 not in questions:
+                    questions.append(q2)
+            elif date_cols:
+                dt = date_cols[0]
+                q2 = f"How many records were created per {dt}?"
+                if q2 not in questions:
+                    questions.append(q2)
+
+        # 3. Top-N ranking prompt
+        if len(questions) < max_questions:
+            if numeric_cols and categorical_cols:
+                num = numeric_cols[-1]
+                cat = categorical_cols[-1]
+                q3 = f"What are the top 5 {cat} by {num}?"
+                if q3 not in questions:
+                    questions.append(q3)
+            elif categorical_cols:
+                cat = categorical_cols[0]
+                q3 = f"What are the most frequent {cat} in {t_name}?"
+                if q3 not in questions:
+                    questions.append(q3)
+            elif numeric_cols:
+                num = numeric_cols[0]
+                q3 = f"What is the average {num} across all {t_name}?"
+                if q3 not in questions:
+                    questions.append(q3)
+
+    # Fallback to general table queries if questions still needed
+    if len(questions) < max_questions:
+        for table in top_tables:
+            if len(questions) >= max_questions:
+                break
+            q_fallback = f"Show the first 10 records from {table.name}"
+            if q_fallback not in questions:
+                questions.append(q_fallback)
+
+    return questions[:max_questions]

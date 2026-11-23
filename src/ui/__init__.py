@@ -16,6 +16,10 @@ from src.ui.async_worker import (
     WorkerEvent,
     WorkerEventType,
 )
+from src.ui.formatters import (
+    format_cell_value,
+    format_ascii_table,
+)
 
 
 def __getattr__(name: str):
@@ -34,6 +38,9 @@ __all__ = [
     "AsyncWorkerManager",
     "WorkerEvent",
     "WorkerEventType",
+    # Data Formatters
+    "format_cell_value",
+    "format_ascii_table",
     # Root Desktop Application
     "NexusApp",
 ]

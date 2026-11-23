@@ -112,6 +112,7 @@ class QueryResult:
     row_count: int
     execution_time_ms: float
     sql: str
+    truncated: bool = False
 
     def to_dicts(self) -> List[Dict[str, Any]]:
         """Convert rows to a list of column-to-value dictionaries."""
@@ -495,7 +496,8 @@ class DatabaseManager:
         self,
         sql: str,
         params: Union[Tuple[Any, ...], Dict[str, Any]] = (),
-        read_only: bool = True
+        read_only: bool = True,
+        max_rows: Optional[int] = 10000
     ) -> QueryResult:
         """
         Primary execution method for Text-to-SQL statements.
@@ -505,14 +507,16 @@ class DatabaseManager:
             params: Query parameter tuple or dict.
             read_only: If True, executes on a thread-local cached connection with
                        PRAGMA query_only = ON. If False, delegates to write pipeline.
+            max_rows: Optional maximum number of rows to retrieve via fetchmany.
+                      Prevents OOM on massive tables. Truncated queries set .truncated = True.
 
         Returns:
-            QueryResult containing column headers, rows, count, and execution time.
+            QueryResult containing column headers, rows, count, execution time, and truncation flag.
         """
         if not read_only:
             # Route mutations to the write transaction pipeline
             self.execute_write(sql, params)
-            return QueryResult(columns=[], rows=[], row_count=0, execution_time_ms=0.0, sql=sql)
+            return QueryResult(columns=[], rows=[], row_count=0, execution_time_ms=0.0, sql=sql, truncated=False)
 
         query_id = self.telemetry.next_query_id()
         start_time = time.perf_counter()
@@ -525,7 +529,22 @@ class DatabaseManager:
             try:
                 cursor.execute(sql, params)
                 columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                rows = cursor.fetchall()
+                truncated = False
+                if max_rows is not None and max_rows > 0:
+                    fetched = cursor.fetchmany(max_rows + 1)
+                    if len(fetched) > max_rows:
+                        rows = fetched[:max_rows]
+                        truncated = True
+                        logger.warning(
+                            f"Query result exceeded max_rows cap ({max_rows}). Truncated {len(fetched)} rows to {max_rows}."
+                        )
+                    else:
+                        rows = fetched
+                        truncated = False
+                else:
+                    rows = cursor.fetchall()
+                    truncated = False
+
                 duration_ms = (time.perf_counter() - start_time) * 1000.0
 
                 telemetry = QueryTelemetry(
@@ -545,7 +564,8 @@ class DatabaseManager:
                     rows=rows,
                     row_count=len(rows),
                     execution_time_ms=duration_ms,
-                    sql=sql
+                    sql=sql,
+                    truncated=truncated
                 )
 
             except sqlite3.OperationalError as exc:

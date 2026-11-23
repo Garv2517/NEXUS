@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import io
 import time
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from tkinter import filedialog, ttk
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import customtkinter
 
@@ -35,9 +37,11 @@ from src.core.db_manager import (
     DatabaseLockedError,
     QueryExecutionError,
 )
+from src.core.export_engine import DataExportEngine
 from src.core.query_guard import QueryGuard, SecurityException, guard_query
 from src.core.schema_parser import SchemaParser, default_parser
 from src.ui.async_worker import AsyncWorkerManager
+from src.ui.formatters import format_ascii_table, format_cell_value
 from src.ui.theme import NexusTheme
 
 
@@ -75,6 +79,12 @@ class DataExplorerTab(customtkinter.CTkFrame):
         self.db = db_manager or DatabaseManager()
         self.schema_parser = schema_parser or default_parser
         self.worker = worker
+
+        self._last_result: Optional[QueryResult] = None
+        self._all_display_rows: List[Tuple[Any, ...]] = []
+        self._active_columns: List[str] = []
+        self._sort_state: Dict[str, bool] = {}
+        self._user_selected_text_mode: bool = False
 
         self._build_ui()
 
@@ -283,10 +293,10 @@ class DataExplorerTab(customtkinter.CTkFrame):
             border_color=NexusTheme.SURFACE_BORDER
         )
         results_container.grid(row=3, column=0, sticky="nsew", padx=NexusTheme.PADDING_MD, pady=(8, NexusTheme.PADDING_MD))
-        results_container.grid_rowconfigure(1, weight=1)
+        results_container.grid_rowconfigure(2, weight=1)
         results_container.grid_columnconfigure(0, weight=1)
 
-        # Results Header Bar
+        # 1. Results Header Bar
         results_header = customtkinter.CTkFrame(results_container, fg_color="transparent")
         results_header.grid(row=0, column=0, sticky="ew", padx=NexusTheme.PADDING_MD, pady=(NexusTheme.PADDING_SM, 4))
         results_header.grid_columnconfigure(0, weight=1)
@@ -309,9 +319,144 @@ class DataExplorerTab(customtkinter.CTkFrame):
         )
         self.latency_badge.grid(row=0, column=1, sticky="e")
 
-        # Monospace Formatted Table View
+        # 2. Results Toolbar (Live Filter, Export Buttons, View Mode Switch)
+        toolbar = customtkinter.CTkFrame(results_container, fg_color="transparent")
+        toolbar.grid(row=1, column=0, sticky="ew", padx=NexusTheme.PADDING_MD, pady=(0, 6))
+        toolbar.grid_columnconfigure(0, weight=1)
+
+        # Live Search Filter Entry
+        self.grid_search_entry = customtkinter.CTkEntry(
+            toolbar,
+            placeholder_text="🔍 Filter displayed rows...",
+            width=210,
+            height=26,
+            font=NexusTheme.FONT_SMALL,
+            fg_color=NexusTheme.BG_OBSIDIAN,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            border_color=NexusTheme.SURFACE_BORDER,
+            border_width=1,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM
+        )
+        self.grid_search_entry.grid(row=0, column=0, sticky="w")
+        self.grid_search_entry.bind("<KeyRelease>", lambda event: self.filter_grid(self.grid_search_entry.get()))
+
+        # Right Action Controls
+        actions_frame = customtkinter.CTkFrame(toolbar, fg_color="transparent")
+        actions_frame.grid(row=0, column=1, sticky="e")
+
+        self.export_csv_btn = customtkinter.CTkButton(
+            actions_frame,
+            text="📊 Export CSV",
+            width=95,
+            height=26,
+            font=NexusTheme.FONT_SMALL,
+            fg_color=NexusTheme.SURFACE_ELEVATED,
+            hover_color=NexusTheme.ACCENT_CYAN_MUTED,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            command=self._handle_export_csv,
+            state="disabled"
+        )
+        self.export_csv_btn.pack(side="left", padx=(0, 6))
+
+        self.export_xlsx_btn = customtkinter.CTkButton(
+            actions_frame,
+            text="📗 Export Excel",
+            width=95,
+            height=26,
+            font=NexusTheme.FONT_SMALL,
+            fg_color=NexusTheme.SURFACE_ELEVATED,
+            hover_color=NexusTheme.ACCENT_CYAN_MUTED,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            command=self._handle_export_xlsx,
+            state="disabled"
+        )
+        self.export_xlsx_btn.pack(side="left", padx=(0, 10))
+
+        self.view_mode_switch = customtkinter.CTkSegmentedButton(
+            actions_frame,
+            values=["Grid", "Text"],
+            width=110,
+            height=26,
+            font=NexusTheme.FONT_SMALL,
+            selected_color=NexusTheme.ACCENT_CYAN,
+            selected_hover_color=NexusTheme.ACCENT_CYAN_HOVER,
+            unselected_color=NexusTheme.SURFACE_ELEVATED,
+            unselected_hover_color=NexusTheme.SURFACE_BORDER,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            command=self._on_view_mode_changed
+        )
+        self.view_mode_switch.set("Grid")
+        self.view_mode_switch.pack(side="left")
+
+        # 3. Main Display Frame Hosting Treeview Grid and Text View
+        self.display_frame = customtkinter.CTkFrame(results_container, fg_color="transparent")
+        self.display_frame.grid(row=2, column=0, sticky="nsew", padx=NexusTheme.PADDING_MD, pady=(0, NexusTheme.PADDING_MD))
+        self.display_frame.grid_rowconfigure(0, weight=1)
+        self.display_frame.grid_columnconfigure(0, weight=1)
+
+        # A. Treeview Grid Frame
+        self.tree_frame = customtkinter.CTkFrame(self.display_frame, fg_color="transparent")
+        self.tree_frame.grid_rowconfigure(0, weight=1)
+        self.tree_frame.grid_columnconfigure(0, weight=1)
+
+        # Configure Scoped ttk.Style for Dark Cyber Treeview
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure(
+            "Nexus.Treeview",
+            background=NexusTheme.BG_OBSIDIAN,
+            foreground=NexusTheme.TEXT_PRIMARY,
+            fieldbackground=NexusTheme.BG_OBSIDIAN,
+            bordercolor=NexusTheme.SURFACE_BORDER,
+            borderwidth=0,
+            rowheight=26,
+            font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Nexus.Treeview.Heading",
+            background=NexusTheme.SURFACE_SLATE,
+            foreground=NexusTheme.ACCENT_CYAN,
+            bordercolor=NexusTheme.SURFACE_BORDER,
+            borderwidth=1,
+            relief="flat",
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.map(
+            "Nexus.Treeview.Heading",
+            background=[("active", NexusTheme.SURFACE_ELEVATED)],
+            foreground=[("active", NexusTheme.ACCENT_CYAN_HOVER)],
+        )
+        style.map(
+            "Nexus.Treeview",
+            background=[("selected", NexusTheme.SURFACE_ELEVATED)],
+            foreground=[("selected", NexusTheme.ACCENT_CYAN)],
+        )
+
+        self.results_tree = ttk.Treeview(
+            self.tree_frame,
+            style="Nexus.Treeview",
+            selectmode="browse"
+        )
+        self.results_tree.tag_configure("evenrow", background=NexusTheme.SURFACE_SLATE)
+        self.results_tree.tag_configure("oddrow", background=NexusTheme.BG_OBSIDIAN)
+
+        tree_vsb = ttk.Scrollbar(self.tree_frame, orient="vertical", command=self.results_tree.yview)
+        tree_hsb = ttk.Scrollbar(self.tree_frame, orient="horizontal", command=self.results_tree.xview)
+        self.results_tree.configure(yscrollcommand=tree_vsb.set, xscrollcommand=tree_hsb.set)
+
+        self.results_tree.grid(row=0, column=0, sticky="nsew")
+        tree_vsb.grid(row=0, column=1, sticky="ns")
+        tree_hsb.grid(row=1, column=0, sticky="ew")
+
+        # B. Monospace Formatted Table View (Backward Compatibility Invariant)
         self.results_textbox = customtkinter.CTkTextbox(
-            results_container,
+            self.display_frame,
             font=NexusTheme.FONT_CODE,
             fg_color=NexusTheme.BG_OBSIDIAN,
             text_color=NexusTheme.TEXT_PRIMARY,
@@ -320,9 +465,27 @@ class DataExplorerTab(customtkinter.CTkFrame):
             corner_radius=NexusTheme.CORNER_RADIUS_SM,
             wrap="none"  # Horizontal scrolling for large tabular datasets
         )
-        self.results_textbox.grid(row=1, column=0, sticky="nsew", padx=NexusTheme.PADDING_MD, pady=(4, NexusTheme.PADDING_MD))
         self.results_textbox.insert("1.0", "(No query executed yet. Run a query above to view tabular results.)")
         self.results_textbox.configure(state="disabled")
+
+        # Default view: Grid mode
+        self._show_grid_view()
+
+    def _show_grid_view(self) -> None:
+        self.results_textbox.grid_forget()
+        self.tree_frame.grid(row=0, column=0, sticky="nsew")
+
+    def _show_text_view(self) -> None:
+        self.tree_frame.grid_forget()
+        self.results_textbox.grid(row=0, column=0, sticky="nsew")
+
+    def _on_view_mode_changed(self, mode: str) -> None:
+        if mode == "Grid":
+            self._user_selected_text_mode = False
+            self._show_grid_view()
+        else:
+            self._user_selected_text_mode = True
+            self._show_text_view()
 
     # --------------------------------------------------------------------------
     # TABLE MANAGEMENT & SELECTION
@@ -506,17 +669,32 @@ class DataExplorerTab(customtkinter.CTkFrame):
             result: QueryResult = data["result"]
             sql: str = data["sql"]
             latency_str = f"{result.execution_time_ms:.2f}ms"
-            self.query_status_label.configure(
-                text=f"✓ Executed successfully ({result.row_count} rows in {latency_str}).",
-                text_color=NexusTheme.STATUS_EMERALD
-            )
-            self.latency_badge.configure(
-                text=f"Latency: {latency_str} | Rows: {result.row_count:,}",
-                text_color=NexusTheme.TEXT_SECONDARY
-            )
+            if getattr(result, "truncated", False):
+                self.query_status_label.configure(
+                    text=f"⚠️ Capped at {result.row_count:,} rows for RAM safety ({latency_str})",
+                    text_color=NexusTheme.STATUS_AMBER
+                )
+                self.latency_badge.configure(
+                    text=f"Latency: {latency_str} | Rows: {result.row_count:,} (capped)",
+                    text_color=NexusTheme.STATUS_AMBER
+                )
+            else:
+                self.query_status_label.configure(
+                    text=f"✓ Executed successfully ({result.row_count} rows in {latency_str}).",
+                    text_color=NexusTheme.STATUS_EMERALD
+                )
+                self.latency_badge.configure(
+                    text=f"Latency: {latency_str} | Rows: {result.row_count:,}",
+                    text_color=NexusTheme.TEXT_SECONDARY
+                )
             self._render_results_grid(result)
 
         elif status == "REJECTED":
+            self.export_csv_btn.configure(state="disabled")
+            self.export_xlsx_btn.configure(state="disabled")
+            self.view_mode_switch.set("Text")
+            self._show_text_view()
+
             err_msg = data.get("error", "Security violation detected.")
             viol_type = data.get("violation_type", "SECURITY_VIOLATION")
             sql = data.get("sql", "")
@@ -537,6 +715,11 @@ class DataExplorerTab(customtkinter.CTkFrame):
             self.results_textbox.configure(state="disabled")
 
         else:  # FAILED
+            self.export_csv_btn.configure(state="disabled")
+            self.export_xlsx_btn.configure(state="disabled")
+            self.view_mode_switch.set("Text")
+            self._show_text_view()
+
             err_msg = data.get("error", "Unknown SQL error.")
             self.query_status_label.configure(
                 text="SQL Execution Failed.",
@@ -551,6 +734,11 @@ class DataExplorerTab(customtkinter.CTkFrame):
         if not self.winfo_exists():
             return
         self.execute_btn.configure(state="normal")
+        self.export_csv_btn.configure(state="disabled")
+        self.export_xlsx_btn.configure(state="disabled")
+        self.view_mode_switch.set("Text")
+        self._show_text_view()
+
         logger.error(f"Worker thread error during query execution: {exc}")
         self.query_status_label.configure(
             text="Query worker error.",
@@ -566,51 +754,218 @@ class DataExplorerTab(customtkinter.CTkFrame):
     # --------------------------------------------------------------------------
 
     def _render_results_grid(self, result: QueryResult) -> None:
-        """Formats QueryResult into a high-density, monospace tabular text grid."""
-        buffer = io.StringIO()
+        """Formats QueryResult into both high-density Treeview grid and ASCII text view."""
+        self._last_result = result
+        self._sort_state.clear()
 
+        # 1. Update export buttons state
+        has_data = bool(result.columns and result.row_count > 0)
+        export_state = "normal" if has_data else "disabled"
+        self.export_csv_btn.configure(state=export_state)
+        self.export_xlsx_btn.configure(state=export_state)
+
+        # 2. Populate text view (Backward Compatibility Invariant)
         if not result.columns:
-            buffer.write("(Statement executed successfully. No return rows.)\n")
+            rendered = "(Statement executed successfully. No return rows.)\n"
         elif result.row_count == 0:
-            buffer.write(" | ".join(f"{col}" for col in result.columns))
-            buffer.write("\n" + "-" * 60 + "\n")
-            buffer.write("(0 rows returned)\n")
+            rendered = " | ".join(f"{col}" for col in result.columns) + "\n" + "-" * 60 + "\n(0 rows returned)\n"
         else:
-            # Calculate column widths (bounded between 6 and 40 characters)
-            col_widths: Dict[str, int] = {}
-            for col in result.columns:
-                col_widths[col] = max(len(col), 6)
-
-            # Sample first 100 rows for formatting
-            preview_rows = result.rows[:100]
-            for row in preview_rows:
-                for idx, col in enumerate(result.columns):
-                    val_str = str(row[idx]) if row[idx] is not None else "NULL"
-                    col_widths[col] = min(max(col_widths[col], len(val_str)), 40)
-
-            # Header row
-            header_parts = [col.ljust(col_widths[col]) for col in result.columns]
-            divider_parts = ["-" * col_widths[col] for col in result.columns]
-            buffer.write("  " + " | ".join(header_parts) + "\n")
-            buffer.write("  " + "-+-".join(divider_parts) + "\n")
-
-            # Data rows
-            for row in preview_rows:
-                row_parts = []
-                for idx, col in enumerate(result.columns):
-                    val_str = str(row[idx]) if row[idx] is not None else "NULL"
-                    if len(val_str) > 40:
-                        val_str = val_str[:37] + "..."
-                    row_parts.append(val_str.ljust(col_widths[col]))
-                buffer.write("  " + " | ".join(row_parts) + "\n")
-
-            if result.row_count > 100:
-                buffer.write(f"\n... [Showing first 100 of {result.row_count:,} total records] ...\n")
+            rendered = format_ascii_table(
+                columns=result.columns,
+                rows=result.rows,
+                max_rows=1000,
+                truncated=getattr(result, "truncated", False)
+            )
 
         self.results_textbox.configure(state="normal")
         self.results_textbox.delete("1.0", "end")
-        self.results_textbox.insert("1.0", buffer.getvalue())
+        self.results_textbox.insert("1.0", rendered)
         self.results_textbox.configure(state="disabled")
+
+        # 3. Setup Treeview Columns
+        self._active_columns = list(result.columns)
+        self.results_tree["columns"] = self._active_columns
+        self.results_tree["show"] = "headings"
+
+        for col in self._active_columns:
+            self.results_tree.heading(col, text=col, command=lambda c=col: self.sort_by_column(c))
+            col_width = max(len(col) * 11, 90)
+            self.results_tree.column(col, width=col_width, minwidth=60, anchor="w")
+
+        # 4. Cache rows and populate grid (capped at 1,000 rows in UI)
+        self._all_display_rows = [
+            tuple(r[i] if i < len(r) else None for i in range(len(self._active_columns)))
+            for r in result.rows
+        ] if result.rows else []
+
+        if hasattr(self, "grid_search_entry"):
+            self.grid_search_entry.delete(0, "end")
+        self.filter_grid("")
+
+        # 5. Display Mode Handling
+        if not self._user_selected_text_mode:
+            self.view_mode_switch.set("Grid")
+            self._show_grid_view()
+
+    def filter_grid(self, search_text: str = "") -> int:
+        """
+        Filters displayed rows in self.results_tree case-insensitively across all columns.
+        Returns matching row count.
+        """
+        for item in self.results_tree.get_children():
+            self.results_tree.delete(item)
+
+        query = (search_text or "").strip().lower()
+
+        matching_count = 0
+        for idx, row in enumerate(self._all_display_rows):
+            row_vals_str = [str(val).lower() if val is not None else "" for val in row]
+            if query and not any(query in s for s in row_vals_str):
+                continue
+
+            matching_count += 1
+            if matching_count <= 1000:
+                tag = "evenrow" if (matching_count % 2 == 0) else "oddrow"
+                display_vals = [format_cell_value(val) for val in row]
+                self.results_tree.insert("", "end", values=display_vals, tags=(tag,))
+
+        return matching_count
+
+    def sort_by_column(self, col_name: str, descending: Optional[bool] = None) -> None:
+        """
+        Sorts displayed rows in self.results_tree by col_name.
+        Uses numeric sorting if all non-None values parse as float, else string sort.
+        None values always sort last.
+        Displays ▲ / ▼ on active column header.
+        """
+        if not self._active_columns or col_name not in self._active_columns:
+            return
+
+        col_idx = self._active_columns.index(col_name)
+
+        if descending is None:
+            current_desc = self._sort_state.get(col_name, False)
+            descending = not current_desc
+        self._sort_state = {col_name: descending}
+
+        # Check if non-None values can be parsed as float
+        is_numeric = True
+        has_non_none = False
+        for r in self._all_display_rows:
+            val = r[col_idx] if col_idx < len(r) else None
+            if val is not None:
+                has_non_none = True
+                try:
+                    float(val)
+                except (ValueError, TypeError):
+                    is_numeric = False
+                    break
+
+        if not has_non_none:
+            is_numeric = False
+
+        # Partition into valid and None items
+        valid_rows = []
+        none_rows = []
+        for r in self._all_display_rows:
+            val = r[col_idx] if col_idx < len(r) else None
+            if val is None:
+                none_rows.append(r)
+            else:
+                valid_rows.append(r)
+
+        if is_numeric:
+            valid_rows.sort(key=lambda r: float(r[col_idx]), reverse=descending)
+        else:
+            valid_rows.sort(key=lambda r: str(r[col_idx]).lower(), reverse=descending)
+
+        self._all_display_rows = valid_rows + none_rows
+
+        # Update column headers with sort arrow
+        for col in self._active_columns:
+            if col == col_name:
+                arrow = " ▼" if descending else " ▲"
+                self.results_tree.heading(col, text=f"{col}{arrow}", command=lambda c=col: self.sort_by_column(c))
+            else:
+                self.results_tree.heading(col, text=col, command=lambda c=col: self.sort_by_column(c))
+
+        # Re-apply current search filter to update the rendered Treeview items
+        search_query = self.grid_search_entry.get() if hasattr(self, "grid_search_entry") else ""
+        self.filter_grid(search_query)
+
+    def export_last_result(
+        self,
+        output_path: Union[str, Path],
+        fmt: str = "csv",
+        on_complete: Optional[Callable[[Path], None]] = None
+    ) -> None:
+        """
+        Programmatically exports all rows of the last query result to CSV or Excel.
+        Executes via AsyncWorkerManager if available, otherwise synchronously.
+        """
+        if not self._last_result or not self._last_result.columns:
+            raise ValueError("No query results available to export.")
+
+        cols = list(self._last_result.columns)
+        rows = list(self._last_result.rows)
+        dest_path = Path(output_path).resolve()
+
+        def _do_export() -> Path:
+            if fmt.lower() in ("xlsx", "excel"):
+                return DataExportEngine.export_excel(cols, rows, dest_path)
+            else:
+                return DataExportEngine.export_csv(cols, rows, dest_path)
+
+        def _on_success(out_path: Path) -> None:
+            if self.winfo_exists():
+                self.query_status_label.configure(
+                    text=f"✓ Exported {len(rows):,} rows to {out_path.name}",
+                    text_color=NexusTheme.STATUS_EMERALD
+                )
+            if callable(on_complete):
+                on_complete(out_path)
+
+        def _on_error(exc: Exception) -> None:
+            logger.error(f"Export failed: {exc}")
+            if self.winfo_exists():
+                self.query_status_label.configure(
+                    text=f"❌ Export failed: {exc}",
+                    text_color=NexusTheme.STATUS_CRIMSON
+                )
+
+        if self.worker and not self.worker.is_shutdown:
+            self.worker.submit_task(
+                _do_export,
+                on_success=_on_success,
+                on_error=_on_error,
+                task_name=f"ExportResults-{fmt}"
+            )
+        else:
+            try:
+                res = _do_export()
+                _on_success(res)
+            except Exception as exc:
+                _on_error(exc)
+
+    def _handle_export_csv(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export Results as CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV File", "*.csv"), ("All Files", "*.*")]
+        )
+        if path:
+            self.export_last_result(path, fmt="csv")
+
+    def _handle_export_xlsx(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export Results as Excel",
+            defaultextension=".xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx"), ("All Files", "*.*")]
+        )
+        if path:
+            self.export_last_result(path, fmt="xlsx")
 
     def _show_security_banner(self, message: str) -> None:
         self.alert_label.configure(text=f"SECURITY INTERCEPT: {message}")

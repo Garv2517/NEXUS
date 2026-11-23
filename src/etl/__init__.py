@@ -16,6 +16,14 @@ from src.etl.etl_engine import (
     SQL_RESERVED_KEYWORDS,
     PROTECTED_PREFIXES,
 )
+from src.etl.ai_profiler import (
+    AIDataProfiler,
+    DatasetProfile,
+    ColumnProfile,
+    PIIFinding,
+    CleaningStep,
+    ProposedCleaningPlan,
+)
 
 __all__ = [
     "ETLEngine",
@@ -28,4 +36,10 @@ __all__ = [
     "sanitize_identifier",
     "SQL_RESERVED_KEYWORDS",
     "PROTECTED_PREFIXES",
+    "AIDataProfiler",
+    "DatasetProfile",
+    "ColumnProfile",
+    "PIIFinding",
+    "CleaningStep",
+    "ProposedCleaningPlan",
 ]

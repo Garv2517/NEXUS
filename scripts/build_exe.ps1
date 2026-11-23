@@ -12,7 +12,7 @@
 .PARAMETER SmokeTest
     Immediately executes the compiled binary with '--smoke-test' to verify runtime integrity.
 .PARAMETER BuildInstaller
-    Compiles an Inno Setup 6 Windows desktop installer (NEXUS-Setup-v1.0.0.exe).
+    Compiles an Inno Setup 6 Windows desktop installer (e.g. NEXUS-Setup-v1.1.0.exe).
 .EXAMPLE
     .\scripts\build_exe.ps1 -Mode onedir -SmokeTest
 .EXAMPLE
@@ -215,7 +215,9 @@ if ($BuildInstaller) {
 
     $installerStart.Stop()
 
-    $installerPath = Join-Path $PSScriptRoot "..\dist\installer\NEXUS-Setup-v1.0.0.exe"
+    $versionPath = Join-Path $PSScriptRoot "..\VERSION"
+    $appVersion = if (Test-Path $versionPath) { (Get-Content $versionPath).Trim() } else { "1.1.0" }
+    $installerPath = Join-Path $PSScriptRoot "..\dist\installer\NEXUS-Setup-v$appVersion.exe"
     $installerPath = [System.IO.Path]::GetFullPath($installerPath)
 
     if (-not (Test-Path $installerPath)) {
@@ -225,7 +227,7 @@ if ($BuildInstaller) {
 
     $installerSizeMB = (Get-Item $installerPath).Length / 1MB
     Write-Host "[OK] Inno Setup Installer: $installerPath" -ForegroundColor Green
-    Write-Host "[OK] NEXUS-Setup-v1.0.0.exe Size: $($installerSizeMB.ToString('F2')) MB" -ForegroundColor Green
+    Write-Host "[OK] NEXUS-Setup-v$appVersion.exe Size: $($installerSizeMB.ToString('F2')) MB" -ForegroundColor Green
     Write-Host "[OK] Installer compiled in $($installerStart.Elapsed.TotalSeconds.ToString('F2')) seconds." -ForegroundColor Green
 }
 

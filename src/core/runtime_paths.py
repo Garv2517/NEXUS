@@ -118,6 +118,16 @@ def get_data_root() -> Path:
     return (get_resource_root() / "data").resolve()
 
 
+def get_writable_data_dir() -> Path:
+    """Alias for get_data_root() ensuring explicit semantic naming for writable storage."""
+    return get_data_root()
+
+
+def get_vault_dir() -> Path:
+    """Return the persistent directory housing the encrypted credential vault."""
+    return get_data_root() / "vault"
+
+
 def get_database_dir() -> Path:
     """Return the persistent directory housing the SQLite database."""
     return get_data_root() / "database"
@@ -134,6 +144,7 @@ def get_raw_uploads_dir() -> Path:
 
 
 def ensure_runtime_directories() -> None:
-    """Ensure persistent directories for database and raw uploads exist on disk."""
+    """Ensure persistent directories for database, raw uploads, and vault exist on disk."""
     get_database_dir().mkdir(parents=True, exist_ok=True)
     get_raw_uploads_dir().mkdir(parents=True, exist_ok=True)
+    get_vault_dir().mkdir(parents=True, exist_ok=True)

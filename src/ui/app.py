@@ -33,14 +33,21 @@ except ImportError:
     logger = logging.getLogger("NEXUS-App")  # type: ignore
 
 from src.core.db_manager import DatabaseManager
+from src.core.key_vault import WindowsDPAPIVault
 from src.core.schema_parser import SchemaParser
+from src.core.session_store import ChatSessionStore
+from src.core.table_manager import TableManager, TableManagerError
 from src.etl.etl_engine import ETLEngine, ETLReport, ETLConfig
+from src.etl.ai_profiler import AIDataProfiler, DatasetProfile, ProposedCleaningPlan
+from src.agent.llm_router import LLMConfig, LLMRouter
 from src.ui.async_worker import AsyncWorkerManager
 from src.ui.theme import NexusTheme, apply_global_theme, mask_secret
 from src.ui.components.sidebar import SidebarPanel
 from src.ui.components.data_explorer_tab import DataExplorerTab
 from src.ui.components.chat_tab import ChatAnalystTab
 from src.ui.components.telemetry_hud_tab import TelemetryHudTab
+from src.ui.components.cleaning_modal import CleaningPlanModal
+from src.ui.components.sheet_picker_modal import SheetPickerModal
 
 
 class NexusApp(customtkinter.CTk):
@@ -72,6 +79,9 @@ class NexusApp(customtkinter.CTk):
         schema_parser: Optional[SchemaParser] = None,
         async_worker: Optional[AsyncWorkerManager] = None,
         poll_interval_ms: int = DEFAULT_POLL_INTERVAL_MS,
+        ai_profiler_router_factory: Optional[Callable[[LLMConfig, Optional[Callable[[], Optional[str]]]], LLMRouter]] = None,
+        key_vault: Optional[WindowsDPAPIVault] = None,
+        session_store: Optional[ChatSessionStore] = None,
         **kwargs: Any
     ) -> None:
         # 1. Bootstrap global cyber theme and Windows DPI awareness prior to geometry setup
@@ -88,8 +98,17 @@ class NexusApp(customtkinter.CTk):
         self.db = db_manager or DatabaseManager()
         self.schema_parser = schema_parser or SchemaParser(self.db)
         self.worker = async_worker or AsyncWorkerManager()
+        self.key_vault = key_vault if key_vault is not None else WindowsDPAPIVault()
+        self.session_store = session_store if session_store is not None else ChatSessionStore(self.db)
         self.poll_interval_ms = max(10, poll_interval_ms)
         self.etl_engine = ETLEngine(db_manager=self.db, schema_parser=self.schema_parser)
+        self.table_manager = TableManager(self.db, self.schema_parser)
+        self.ai_profiler_router_factory = ai_profiler_router_factory or (
+            lambda cfg, key_fn: LLMRouter(config=cfg, api_key_provider=key_fn)
+        )
+        self._ai_profiler_router_factory = self.ai_profiler_router_factory
+        self._active_cleaning_modal: Optional[CleaningPlanModal] = None
+        self._active_sheet_modal: Optional[SheetPickerModal] = None
 
         # 4. Lifecycle & Timer State
         self._is_closing: bool = False
@@ -108,6 +127,10 @@ class NexusApp(customtkinter.CTk):
 
         # 8. Start Non-Blocking Startup Discovery of Installed Local Ollama Models
         self._discover_local_models_async()
+
+        # 9. Asynchronous refresh of starter questions in chat tab reflecting active schema
+        if hasattr(self, "chat_tab") and hasattr(self.chat_tab, "refresh_starter_questions"):
+            self.chat_tab.refresh_starter_questions()
 
         logger.info(
             f"NEXUS Desktop Shell successfully initialized. "
@@ -138,7 +161,10 @@ class NexusApp(customtkinter.CTk):
             on_file_selected=self._handle_file_selected,
             on_table_selected=self._handle_table_selected,
             on_llm_config_changed=self._handle_llm_config_changed,
-            width=300
+            on_rename_table=self._handle_rename_table,
+            on_drop_table=self._handle_drop_table,
+            width=300,
+            key_vault=self.key_vault
         )
         self.sidebar.grid(row=0, column=0, sticky="nsew")
 
@@ -190,7 +216,8 @@ class NexusApp(customtkinter.CTk):
             get_llm_config_fn=self.sidebar.get_llm_config,
             get_volatile_api_key_fn=self.sidebar.get_volatile_api_key,
             on_open_sql_in_explorer=self._handle_open_sql_in_explorer,
-            on_query_completed=self._handle_agent_query_completed
+            on_query_completed=self._handle_agent_query_completed,
+            session_store=self.session_store
         )
         self.chat_tab.grid(row=0, column=0, sticky="nsew")
 
@@ -272,6 +299,84 @@ class NexusApp(customtkinter.CTk):
         self.tabview.set("Data Explorer")
         self.data_explorer_tab.select_table_and_preview(table_name)
         self.set_status_message(f"Selected table: '{table_name}' (loading preview...)")
+
+    def _handle_rename_table(self, old_name: str, new_name: str) -> None:
+        """Renames a user table via TableManager asynchronously, refreshing schema and UI."""
+        self.set_status_message(f"⏳ Renaming table '{old_name}' -> '{new_name}'...", revert_after_ms=None)
+
+        def _task() -> str:
+            return self.table_manager.rename_table(old_name, new_name)
+
+        def _on_success(renamed: str) -> None:
+            if not self.winfo_exists() or self._is_closing:
+                return
+            logger.info(f"Table successfully renamed: {old_name} -> {renamed}")
+            self.set_status_message(f"✅ Table renamed: '{old_name}' -> '{renamed}'", revert_after_ms=8000)
+            self.schema_parser.invalidate_cache()
+            self.sidebar.refresh_schema()
+            self.data_explorer_tab.refresh_table_list()
+            if hasattr(self, "chat_tab") and hasattr(self.chat_tab, "refresh_starter_questions"):
+                self.chat_tab.refresh_starter_questions()
+
+        def _on_error(exc: Exception) -> None:
+            if not self.winfo_exists() or self._is_closing:
+                return
+            err_msg = str(exc)
+            logger.error(f"Failed to rename table '{old_name}': {err_msg}")
+            self.set_status_message(f"❌ Rename Failed: {err_msg}", revert_after_ms=10000)
+
+        if self.worker and not self.worker.is_shutdown:
+            self.worker.submit_task(
+                _task,
+                on_success=_on_success,
+                on_error=_on_error,
+                task_name=f"RenameTable-{old_name}"
+            )
+        else:
+            try:
+                res = _task()
+                _on_success(res)
+            except Exception as exc:
+                _on_error(exc)
+
+    def _handle_drop_table(self, table_name: str) -> None:
+        """Drops a user table via TableManager asynchronously, refreshing schema and UI."""
+        self.set_status_message(f"⏳ Dropping table '{table_name}'...", revert_after_ms=None)
+
+        def _task() -> None:
+            self.table_manager.drop_table(table_name)
+
+        def _on_success(_res: Any) -> None:
+            if not self.winfo_exists() or self._is_closing:
+                return
+            logger.info(f"Table successfully dropped: {table_name}")
+            self.set_status_message(f"✅ Table '{table_name}' dropped", revert_after_ms=8000)
+            self.schema_parser.invalidate_cache()
+            self.sidebar.refresh_schema()
+            self.data_explorer_tab.refresh_table_list()
+            if hasattr(self, "chat_tab") and hasattr(self.chat_tab, "refresh_starter_questions"):
+                self.chat_tab.refresh_starter_questions()
+
+        def _on_error(exc: Exception) -> None:
+            if not self.winfo_exists() or self._is_closing:
+                return
+            err_msg = str(exc)
+            logger.error(f"Failed to drop table '{table_name}': {err_msg}")
+            self.set_status_message(f"❌ Drop Failed: {err_msg}", revert_after_ms=10000)
+
+        if self.worker and not self.worker.is_shutdown:
+            self.worker.submit_task(
+                _task,
+                on_success=_on_success,
+                on_error=_on_error,
+                task_name=f"DropTable-{table_name}"
+            )
+        else:
+            try:
+                _task()
+                _on_success(None)
+            except Exception as exc:
+                _on_error(exc)
 
     def _handle_llm_config_changed(self, config: Dict[str, Any]) -> None:
         """
@@ -397,50 +502,192 @@ class NexusApp(customtkinter.CTk):
     def _handle_file_selected(self, file_path: str) -> None:
         """
         Invoked when a dataset file is chosen via the sidebar dropzone / selector.
-        Stages file for Phase 3 ETL processing, and if the file exists on disk,
-        dispatches the high-speed background ETL pipeline with live progress streaming.
+        If the file is an Excel workbook (.xlsx, .xls) with multiple sheets, displays
+        the SheetPickerModal first. Then proceeds to AI Smart Clean profiling or
+        direct ETL ingestion.
+        """
+        ext = Path(file_path).suffix.lower()
+        if os.path.exists(file_path) and ext in (".xlsx", ".xls"):
+            try:
+                sheets = ETLEngine.list_excel_sheets(file_path)
+            except Exception as e:
+                logger.warning(f"Failed to inspect Excel sheets for {file_path}: {e}")
+                sheets = []
+
+            if len(sheets) > 1:
+                def _on_sheet_selected(chosen_sheet: str) -> None:
+                    self._active_sheet_modal = None
+                    self._proceed_with_file_ingestion(file_path, sheet_name=chosen_sheet)
+
+                def _on_sheet_cancelled() -> None:
+                    self._active_sheet_modal = None
+                    self.set_status_message("Excel sheet selection cancelled. Ready.", revert_after_ms=5000)
+
+                self._active_sheet_modal = SheetPickerModal(
+                    master=self,
+                    file_name=Path(file_path).name,
+                    sheet_names=sheets,
+                    on_select=_on_sheet_selected,
+                    on_cancel=_on_sheet_cancelled,
+                )
+                return
+
+        self._proceed_with_file_ingestion(file_path, sheet_name=None)
+
+    def _proceed_with_file_ingestion(self, file_path: str, sheet_name: Optional[str] = None) -> None:
+        """
+        Proceeds with file profiling and ingestion after optional worksheet selection.
         """
         filename = os.path.basename(file_path)
-        logger.info(f"Dataset staged for Phase 3 ETL: {file_path}")
-        self.set_status_message(f"Dataset staged for Phase 3 ETL: {filename}")
+        display_name = f"{filename} [{sheet_name}]" if sheet_name else filename
+        ai_clean = self.sidebar.is_ai_clean_enabled()
 
-        if os.path.exists(file_path):
+        if not ai_clean:
+            logger.info(f"Dataset staged for Phase 3 ETL: {file_path} (sheet={sheet_name})")
+            self.set_status_message(f"Dataset staged for Phase 3 ETL: {filename}")
+            if os.path.exists(file_path):
+                self._start_etl_ingestion(file_path, cleaning_plan=None, sheet_name=sheet_name)
+            return
+
+        if not os.path.exists(file_path):
+            self.set_status_message(f"❌ File not found: {file_path}", revert_after_ms=8000)
+            return
+        llm_cfg = LLMConfig.from_sidebar_dict(self.sidebar.get_llm_config())
+        key_provider = self.sidebar.get_volatile_api_key
+
+        self.set_status_message(f"🤖 AI Smart Clean: Profiling '{display_name}' & generating safe plan...", revert_after_ms=None)
+        if hasattr(self.sidebar, "file_label") and self.sidebar.file_label.winfo_exists():
+            self.sidebar.file_label.configure(
+                text=f"🤖 Profiling {display_name}...",
+                text_color=NexusTheme.ACCENT_CYAN
+            )
+
+        def _profile_and_propose() -> Tuple[DatasetProfile, ProposedCleaningPlan]:
+            profiler = AIDataProfiler()
+            profile = profiler.profile_file(file_path, sheet_name=sheet_name)
+            factory = getattr(self, "ai_profiler_router_factory", None) or self._ai_profiler_router_factory
+            router = factory(llm_cfg, key_provider)
+            plan = profiler.propose_cleaning_plan(profile, llm_router=router)
+            return profile, plan
+
+        def _on_profile_success(result: Tuple[DatasetProfile, ProposedCleaningPlan]) -> None:
+            if not self.winfo_exists() or self._is_closing:
+                return
+
+            profile, plan = result
+            logger.info(f"AI Profiling complete for {display_name}. Health: {profile.health_score}/100, Steps: {len(plan.steps)}")
+            self.set_status_message(f"🤖 AI Profiling complete ({profile.health_score}/100). Awaiting approval...", revert_after_ms=None)
+
+            def _on_apply(payload: List[Dict[str, Any]]) -> None:
+                self._active_cleaning_modal = None
+                self._start_etl_ingestion(file_path, cleaning_plan=payload, sheet_name=sheet_name)
+
+            def _on_skip() -> None:
+                self._active_cleaning_modal = None
+                self._start_etl_ingestion(file_path, cleaning_plan=None, sheet_name=sheet_name)
+
+            def _on_cancel() -> None:
+                self._active_cleaning_modal = None
+                self.set_status_message("AI Smart Clean cancelled. Ready.", revert_after_ms=5000)
+                if hasattr(self.sidebar, "file_label") and self.sidebar.file_label.winfo_exists():
+                    self.sidebar.file_label.configure(
+                        text="No file selected",
+                        text_color=NexusTheme.TEXT_MUTED
+                    )
+
+            self._active_cleaning_modal = CleaningPlanModal(
+                master=self,
+                profile=profile,
+                plan=plan,
+                on_apply=_on_apply,
+                on_skip=_on_skip,
+                on_cancel=_on_cancel,
+            )
+
+        def _on_profile_error(exc: Exception) -> None:
+            if not self.winfo_exists() or self._is_closing:
+                return
+            err_msg = mask_secret(str(exc))
+            logger.error(f"AI Profiling error: {err_msg}")
+            self.set_status_message(f"❌ AI Profiling failed: {err_msg}", revert_after_ms=10000)
             if hasattr(self.sidebar, "file_label") and self.sidebar.file_label.winfo_exists():
                 self.sidebar.file_label.configure(
-                    text=f"⏳ Ingesting {filename}...",
-                    text_color=NexusTheme.ACCENT_CYAN
+                    text="❌ Profiling failed",
+                    text_color=NexusTheme.STATUS_CRIMSON
                 )
 
+        if self.worker and not self.worker.is_shutdown:
             self.worker.submit_task(
-                self.etl_engine.ingest_file,
-                file_path,
-                on_success=self._on_etl_success,
-                on_error=self._on_etl_error,
-                on_progress=self._on_etl_progress,
-                task_name=f"ETL-{filename}"
+                _profile_and_propose,
+                on_success=_on_profile_success,
+                on_error=_on_profile_error,
+                task_name=f"AIProfile-{filename}"
             )
+        else:
+            try:
+                res = _profile_and_propose()
+                _on_profile_success(res)
+            except Exception as exc:
+                _on_profile_error(exc)
+
+    def _start_etl_ingestion(
+        self,
+        file_path: str,
+        cleaning_plan: Optional[List[Dict[str, Any]]] = None,
+        table_name: Optional[str] = None,
+        config: Optional[ETLConfig] = None,
+        sheet_name: Optional[str] = None
+    ) -> str:
+        """
+        Dispatches background ETL ingestion with live progress updates and post-ingest UI refresh.
+        Shared between direct raw ingestion and modal-approved AI Smart Clean ingestion.
+        """
+        filename = os.path.basename(file_path)
+        display_name = f"{filename} [{sheet_name}]" if sheet_name else filename
+        if hasattr(self.sidebar, "file_label") and self.sidebar.file_label.winfo_exists():
+            self.sidebar.file_label.configure(
+                text=f"⏳ Ingesting {display_name}...",
+                text_color=NexusTheme.ACCENT_CYAN
+            )
+
+        cfg = config or ETLConfig()
+        if cleaning_plan is not None:
+            cfg.cleaning_plan = cleaning_plan
+        if sheet_name is not None:
+            cfg.sheet_name = sheet_name
+
+        return self.worker.submit_task(
+            self.etl_engine.ingest_file,
+            file_path,
+            table_name=table_name,
+            config=cfg,
+            sheet_name=sheet_name,
+            on_success=self._on_etl_success,
+            on_error=self._on_etl_error,
+            on_progress=self._on_etl_progress,
+            task_name=f"ETL-{filename}"
+        )
 
     def ingest_dataset(
         self,
         file_path: str,
         table_name: Optional[str] = None,
-        config: Optional[ETLConfig] = None
+        config: Optional[ETLConfig] = None,
+        sheet_name: Optional[str] = None
     ) -> str:
         """
         Programmatically dispatches background ETL ingestion for a file.
         Returns the generated task_id from AsyncWorkerManager.
         """
         filename = os.path.basename(file_path)
-        self.set_status_message(f"⚡ Ingesting '{filename}' into SQLite...", revert_after_ms=None)
-        return self.worker.submit_task(
-            self.etl_engine.ingest_file,
-            file_path,
+        display_name = f"{filename} [{sheet_name}]" if sheet_name else filename
+        self.set_status_message(f"⚡ Ingesting '{display_name}' into SQLite...", revert_after_ms=None)
+        return self._start_etl_ingestion(
+            file_path=file_path,
             table_name=table_name,
             config=config,
-            on_success=self._on_etl_success,
-            on_error=self._on_etl_error,
-            on_progress=self._on_etl_progress,
-            task_name=f"ETL-{filename}"
+            cleaning_plan=config.cleaning_plan if config else None,
+            sheet_name=sheet_name
         )
 
     def _on_etl_progress(self, progress_msg: str) -> None:
@@ -473,6 +720,8 @@ class NexusApp(customtkinter.CTk):
         self.schema_parser.invalidate_cache()
         self.sidebar.refresh_schema()
         self.data_explorer_tab.refresh_table_list()
+        if hasattr(self, "chat_tab") and hasattr(self.chat_tab, "refresh_starter_questions"):
+            self.chat_tab.refresh_starter_questions()
 
         # 4. Instant jump to Data Explorer and preview the new table
         self.tabview.set("Data Explorer")
@@ -604,11 +853,16 @@ class NexusApp(customtkinter.CTk):
             return
         self.set_status_message("Engine refresh: Updating schema reflection and active tab...")
         self.sidebar.refresh_schema()
+        if hasattr(self, "chat_tab") and hasattr(self.chat_tab, "refresh_starter_questions"):
+            self.chat_tab.refresh_starter_questions()
         current_tab = self.tabview.get()
         if current_tab == "Data Explorer":
             self.data_explorer_tab.refresh_table_list()
         elif current_tab == "Security & Telemetry HUD":
             self.telemetry_hud_tab.refresh_hud()
+
+    # Backward compatibility alias
+    _handle_refresh_all = _handle_f5_refresh
 
     # --------------------------------------------------------------------------
     # DETERMINISTIC SHUTDOWN PROTOCOL
@@ -641,10 +895,10 @@ class NexusApp(customtkinter.CTk):
                 pass
             self._transient_clear_after_id = None
 
-        # 3. Terminate background worker pool (wait=False to prevent hangs on exit)
+        # 3. Terminate background worker pool (wait=True ensures in-flight queries drain before DB close)
         try:
             if self.worker and not self.worker.is_shutdown:
-                self.worker.shutdown(wait=False)
+                self.worker.shutdown(wait=True)
         except Exception as exc:
             logger.warning(f"Error terminating AsyncWorkerManager during shutdown: {exc}")
 
@@ -655,8 +909,29 @@ class NexusApp(customtkinter.CTk):
         except Exception as exc:
             logger.warning(f"Error closing DatabaseManager during shutdown: {exc}")
 
-        # 5. Destroy root window safely
+        # 5. Cleanly destroy active modal if open
+        if self._active_cleaning_modal is not None:
+            try:
+                if self._active_cleaning_modal.winfo_exists():
+                    self._active_cleaning_modal.destroy()
+            except Exception:
+                pass
+            self._active_cleaning_modal = None
+
+        if self._active_sheet_modal is not None:
+            try:
+                if self._active_sheet_modal.winfo_exists():
+                    self._active_sheet_modal.destroy()
+            except Exception:
+                pass
+            self._active_sheet_modal = None
+
+        # 6. Destroy root window safely
         try:
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
             self.destroy()
         except Exception as exc:
             logger.debug(f"Exception during window destroy: {exc}")

@@ -51,7 +51,9 @@ class TestUIComponents(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         try:
+            cls.root.update_idletasks()
             cls.root.destroy()
+            time.sleep(0.15)
         except Exception:
             pass
 
@@ -190,7 +192,7 @@ class TestUIComponents(unittest.TestCase):
         # Check results in textbox
         results_content = explorer.results_textbox.get("1.0", "end")
         self.assertIn("Acme Corp", results_content)
-        self.assertIn("5400.0", results_content)
+        self.assertTrue("5400.0" in results_content or "5,400.00" in results_content)
         self.assertIn("1 rows", explorer.query_status_label.cget("text"))
 
         # Verify SUCCESS logged in _nexus_query_audit

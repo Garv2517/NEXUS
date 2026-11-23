@@ -281,6 +281,10 @@ class SchemaParser:
         for t_name in table_names:
             yield self.inspect_table(t_name, fetch_samples=fetch_samples, sample_limit=sample_limit)
 
+    def get_schema_info(self, tables: Optional[List[str]] = None) -> List[TableInfo]:
+        """Returns TableInfo metadata list for target tables or all user tables."""
+        return list(self.iter_tables(tables=tables, fetch_samples=False))
+
     # --------------------------------------------------------------------------
     # MARKDOWN FORMATTING & PROMPT GENERATION
     # --------------------------------------------------------------------------
@@ -404,6 +408,113 @@ class SchemaParser:
             "total_foreign_keys": total_fks,
             "table_names": tables,
         }
+
+    def select_relevant_tables(self, query: str, max_tables: int = 8) -> List[str]:
+        """
+        Dynamically selects a relevant subset of database tables for prompt pruning.
+
+        Algorithm:
+        1. Tokenizes natural language query stripping English stop words.
+        2. Scores tables deterministically via weighted keyword and column matching.
+        3. Expands seeds using 1-hop bidirectional Foreign Key graph connectivity.
+        4. Degrades to row-count weighted fallback if 0 token matches occur.
+        """
+        all_tables = self.get_table_names()
+        if len(all_tables) <= max_tables or not query or not query.strip():
+            return all_tables
+
+        stop_words = {
+            "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are",
+            "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but",
+            "by", "can", "did", "do", "does", "doing", "down", "during", "each", "few", "for", "from",
+            "further", "get", "had", "has", "have", "having", "he", "her", "here", "hers", "herself",
+            "him", "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just",
+            "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once",
+            "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "same", "select",
+            "show", "so", "some", "such", "than", "that", "the", "their", "theirs", "them", "themselves",
+            "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until",
+            "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom",
+            "why", "will", "with", "you", "your", "yours", "yourself", "yourselves"
+        }
+
+        # Tokenize query: lowercase alphanumeric tokens >= 2 chars
+        raw_tokens = re.findall(r"[a-zA-Z0-9]+", query.lower())
+        query_tokens = [tok for tok in raw_tokens if len(tok) >= 2 and tok not in stop_words]
+
+        # Inspect all candidate tables
+        table_infos: Dict[str, TableInfo] = {}
+        outbound_fks: Dict[str, Set[str]] = {t: set() for t in all_tables}
+        inbound_fks: Dict[str, Set[str]] = {t: set() for t in all_tables}
+
+        for t in all_tables:
+            info = self.inspect_table(t, fetch_samples=False)
+            table_infos[t] = info
+            for fk in info.foreign_keys:
+                target = fk.get("target_table")
+                if target and target in all_tables:
+                    outbound_fks[t].add(target)
+                    inbound_fks[target].add(t)
+
+        # Deterministic scoring
+        table_scores: Dict[str, float] = {t: 0.0 for t in all_tables}
+        for t, info in table_infos.items():
+            t_lower = t.lower()
+            t_subtokens = set(re.findall(r"[a-zA-Z0-9]+", t_lower))
+
+            # 1. Table name matching (+5 exact, +3 subtoken, +2 substring)
+            for q_tok in query_tokens:
+                if q_tok == t_lower:
+                    table_scores[t] += 5.0
+                elif q_tok in t_subtokens:
+                    table_scores[t] += 3.0
+                elif q_tok in t_lower or (len(t_lower) >= 3 and t_lower in q_tok):
+                    table_scores[t] += 2.0
+
+            # 2. Column name matching (+2.5 exact, +2.0 subtoken)
+            for col in info.columns:
+                c_lower = col.name.lower()
+                c_subtokens = set(re.findall(r"[a-zA-Z0-9]+", c_lower))
+                for q_tok in query_tokens:
+                    if q_tok == c_lower:
+                        table_scores[t] += 2.5
+                    elif q_tok in c_subtokens:
+                        table_scores[t] += 2.0
+
+        # Fallback if 0 tokens matched
+        if all(score == 0.0 for score in table_scores.values()):
+            sorted_tables = sorted(
+                all_tables,
+                key=lambda t: (-table_infos[t].estimated_rows, t)
+            )
+            return sorted_tables[:max_tables]
+
+        # Rank seed tables
+        seed_candidates = [t for t in all_tables if table_scores[t] > 0]
+        seed_candidates.sort(key=lambda t: (-table_scores[t], -table_infos[t].estimated_rows, t))
+
+        selected: List[str] = []
+        selected_set: Set[str] = set()
+
+        # Seed and 1-hop FK neighbor expansion
+        for seed in seed_candidates:
+            if seed not in selected_set and len(selected) < max_tables:
+                selected.append(seed)
+                selected_set.add(seed)
+
+            # Bidirectional FK expansion
+            neighbors = sorted(
+                outbound_fks[seed] | inbound_fks[seed],
+                key=lambda n: (-table_scores.get(n, 0.0), -table_infos[n].estimated_rows, n)
+            )
+            for neighbor in neighbors:
+                if neighbor not in selected_set and len(selected) < max_tables:
+                    selected.append(neighbor)
+                    selected_set.add(neighbor)
+
+            if len(selected) >= max_tables:
+                break
+
+        return selected[:max_tables]
 
 
 # Default module instance for direct use

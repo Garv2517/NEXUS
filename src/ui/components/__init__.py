@@ -12,10 +12,14 @@ from src.ui.components.sidebar import SidebarPanel
 from src.ui.components.data_explorer_tab import DataExplorerTab
 from src.ui.components.telemetry_hud_tab import TelemetryHudTab
 from src.ui.components.chat_tab import ChatAnalystTab
+from src.ui.components.cleaning_modal import CleaningPlanModal
+from src.ui.components.sheet_picker_modal import SheetPickerModal
 
 __all__ = [
     "SidebarPanel",
     "DataExplorerTab",
     "TelemetryHudTab",
     "ChatAnalystTab",
+    "CleaningPlanModal",
+    "SheetPickerModal",
 ]

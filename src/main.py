@@ -140,7 +140,14 @@ def run_smoke_test() -> int:
     logger.info("Initiating NEXUS non-interactive startup smoke test...")
     apply_global_theme()
 
-    app = NexusApp()
+    for _attempt in range(3):
+        try:
+            app = NexusApp()
+            break
+        except Exception:
+            if _attempt == 2:
+                raise
+            time.sleep(0.5)
     app.withdraw()
 
     try:

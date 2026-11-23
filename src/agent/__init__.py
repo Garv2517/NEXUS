@@ -22,7 +22,9 @@ from src.agent.chart_engine import (
 from src.agent.sql_chain import (
     SQLAgentChain,
     AgentRunResult,
+    ConversationTurn,
     extract_sql_from_response,
+    generate_starter_questions,
 )
 
 __all__ = [
@@ -42,5 +44,7 @@ __all__ = [
     # Autonomous SQL Chain
     "SQLAgentChain",
     "AgentRunResult",
+    "ConversationTurn",
     "extract_sql_from_response",
+    "generate_starter_questions",
 ]

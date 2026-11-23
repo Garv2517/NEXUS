@@ -209,6 +209,7 @@ class ETLConfig:
     encoding: Optional[str] = None          # Auto-detected if None
     delimiter: Optional[str] = None         # Auto-detected if None
     cleaning_plan: Optional[List[Dict[str, Any]]] = None
+    sheet_name: Optional[Union[str, int]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -329,6 +330,7 @@ class CleaningPlanExecutor:
         Returns the modified DataFrame and a list of applied step descriptions.
         """
         cls.validate_plan(plan)
+        df = df.copy()
         applied_steps: List[str] = []
 
         for step in plan:
@@ -437,6 +439,13 @@ class CleaningPlanExecutor:
 
         return df, applied_steps
 
+    @classmethod
+    def apply(cls, df: pd.DataFrame, plan: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, List[str]]:
+        """
+        Alias for execute() implementing the apply(df, cleaning_plan) contract.
+        """
+        return cls.execute(df, plan)
+
 
 # ==============================================================================
 # HIGH-SPEED AUTOMATED PANDAS ETL ENGINE
@@ -464,6 +473,38 @@ class ETLEngine:
     # --------------------------------------------------------------------------
     # FILE FORMAT & ENCODING DETECTION
     # --------------------------------------------------------------------------
+
+    @staticmethod
+    def list_excel_sheets(file_path: Union[str, Path]) -> List[str]:
+        """
+        Returns sheet names for .xlsx / .xls files without loading full sheet data into RAM.
+        Returns an empty list [] for non-Excel files or unreadable files.
+        """
+        path = Path(file_path)
+        if not path.is_file():
+            return []
+        ext = path.suffix.lower()
+        if ext not in (".xlsx", ".xls"):
+            return []
+
+        # For .xlsx, use openpyxl read-only mode for sub-millisecond metadata inspection
+        if ext == ".xlsx":
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(str(path), read_only=True, keep_links=False)
+                sheets = list(wb.sheetnames)
+                wb.close()
+                return sheets
+            except Exception:
+                pass
+
+        # Fallback using pd.ExcelFile (reads metadata only without loading sheets)
+        try:
+            with pd.ExcelFile(path) as xls:
+                return list(xls.sheet_names)
+        except Exception as exc:
+            logger.debug(f"Could not list excel sheets for {path}: {exc}")
+            return []
 
     @staticmethod
     def detect_encoding_and_delimiter(
@@ -624,7 +665,9 @@ class ETLEngine:
         file_path: Union[str, Path],
         table_name: Optional[str] = None,
         config: Optional[ETLConfig] = None,
-        progress_callback: Optional[Callable[[str], None]] = None
+        progress_callback: Optional[Callable[[str], None]] = None,
+        cleaning_plan: Optional[List[Dict[str, Any]]] = None,
+        sheet_name: Optional[Union[str, int]] = None
     ) -> ETLReport:
         """
         High-throughput, fully automated ingestion pipeline.
@@ -636,12 +679,16 @@ class ETLEngine:
             table_name: Optional destination table name (auto-derived if None).
             config: Optional ETLConfig specifying processing parameters.
             progress_callback: Optional UI callback for progress streaming.
+            cleaning_plan: Optional CleaningPlanExecutor payload to apply.
+            sheet_name: Optional sheet name or index for multi-sheet Excel files.
 
         Returns:
             Structured ETLReport with complete profiling and audit metrics.
         """
         start_time = time.perf_counter()
         config = config or ETLConfig()
+        if cleaning_plan is not None:
+            config.cleaning_plan = cleaning_plan
         file_path = Path(file_path).resolve()
 
         if not file_path.exists() or not file_path.is_file():
@@ -653,13 +700,21 @@ class ETLEngine:
                 f"Unsupported file format '{ext}'. Supported formats: {sorted(list(self.SUPPORTED_EXTENSIONS))}"
             )
 
+        target_sheet = sheet_name if sheet_name is not None else config.sheet_name
+
         # 1. Sanitize Target Table Identifier
         if not table_name:
-            table_name = config.table_name or file_path.stem
+            if config.table_name:
+                table_name = config.table_name
+            elif target_sheet is not None and ext in (".xlsx", ".xls"):
+                table_name = f"{file_path.stem}_{target_sheet}"
+            else:
+                table_name = file_path.stem
         sanitized_table = sanitize_identifier(table_name, is_table=True)
 
         if progress_callback:
-            progress_callback(f"Analyzing {file_path.name} (Format: {ext.upper()})...")
+            sheet_info = f" (Sheet: {target_sheet})" if target_sheet is not None else ""
+            progress_callback(f"Analyzing {file_path.name}{sheet_info} (Format: {ext.upper()})...")
 
         # 2. Detect Encoding & Delimiter for Text Formats
         encoding = config.encoding
@@ -692,7 +747,10 @@ class ETLEngine:
                 except ValueError:
                     df = pd.read_json(file_path)
             elif ext in (".xlsx", ".xls"):
-                df = pd.read_excel(file_path)
+                if target_sheet is not None:
+                    df = pd.read_excel(file_path, sheet_name=target_sheet)
+                else:
+                    df = pd.read_excel(file_path)
             elif ext == ".parquet":
                 df = pd.read_parquet(file_path)
             else:

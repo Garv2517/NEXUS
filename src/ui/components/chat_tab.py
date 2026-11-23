@@ -13,6 +13,7 @@ Platform: Windows (Python 3.13) / CustomTkinter
 from __future__ import annotations
 
 import io
+from pathlib import Path
 import re
 import time
 from tkinter import filedialog
@@ -45,12 +46,17 @@ from src.agent.llm_router import (
 )
 from src.agent.sql_chain import (
     AgentRunResult,
+    ConversationTurn,
     SQLAgentChain,
     extract_sql_from_response,
+    generate_starter_questions,
 )
 from src.core.db_manager import DatabaseManager, QueryResult
+from src.core.export_engine import DataExportEngine, ExecutiveBriefExporter
 from src.core.schema_parser import SchemaParser, default_parser
+from src.core.session_store import ChatSessionStore
 from src.ui.async_worker import AsyncWorkerManager
+from src.ui.formatters import format_ascii_table
 from src.ui.theme import NexusTheme, mask_secret
 
 
@@ -89,6 +95,7 @@ class ChatAnalystTab(customtkinter.CTkFrame):
         on_open_sql_in_explorer: Optional[Callable[[str], None]] = None,
         on_query_completed: Optional[Callable[[AgentRunResult], None]] = None,
         llm_router_factory: Optional[Callable[[LLMConfig, Optional[Callable[[], Optional[str]]]], LLMRouter]] = None,
+        session_store: Optional[ChatSessionStore] = None,
         **kwargs: Any
     ) -> None:
         worker = async_worker or kwargs.pop("worker_manager", None)
@@ -113,11 +120,17 @@ class ChatAnalystTab(customtkinter.CTkFrame):
         self.llm_router_factory = llm_router_factory or (
             lambda cfg, key_fn: LLMRouter(config=cfg, api_key_provider=key_fn)
         )
+        self.session_store = session_store
+        self._active_session_id: Optional[str] = None
+        self._session_label_to_id: Dict[str, str] = {}
 
-        # Matplotlib and progress state
+        # Matplotlib, memory and progress state
         self._embedded_figures: List[Figure] = []
+        self._conversation_history: List[ConversationTurn] = []
         self._active_progress_frame: Optional[customtkinter.CTkFrame] = None
         self._active_progress_label: Optional[customtkinter.CTkLabel] = None
+        self.export_csv_btn: Optional[customtkinter.CTkButton] = None
+        self.export_brief_btn: Optional[customtkinter.CTkButton] = None
 
         self._build_ui()
 
@@ -128,24 +141,34 @@ class ChatAnalystTab(customtkinter.CTkFrame):
         self._handle_send_query = self.send_user_message
         self._handle_copy_schema_context = self.copy_schema_context_to_clipboard
 
-        self._post_welcome_bubble()
+        if self.session_store is not None:
+            self._initialize_sessions()
+        else:
+            self._post_welcome_bubble()
+            self.refresh_starter_questions()
 
     # --------------------------------------------------------------------------
     # UI CONSTRUCTION
     # --------------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        """Constructs layout: header bar, scrollable message feed, and input bar."""
-        self.grid_rowconfigure(1, weight=1)  # Chat feed expands
+        """Constructs layout: header bar, session bar, scrollable message feed, starter chips, and input bar."""
+        self.grid_rowconfigure(2, weight=1)  # Chat feed expands
         self.grid_columnconfigure(0, weight=1)
 
         # 1. Header & Context Utility Bar
         self._build_header_bar()
 
-        # 2. Scrollable Chat Message Feed
+        # 2. Compact Session Switcher Bar (U4)
+        self._build_session_bar()
+
+        # 3. Scrollable Chat Message Feed
         self._build_chat_feed()
 
-        # 3. Bottom Natural Language Input Bar
+        # 4. Starter Question Chips Row (U2.5)
+        self._build_starter_chips_bar()
+
+        # 5. Bottom Natural Language Input Bar
         self._build_input_bar()
 
     def _build_header_bar(self) -> None:
@@ -203,6 +226,30 @@ class ChatAnalystTab(customtkinter.CTkFrame):
         )
         self.check_health_btn.pack(side="left", padx=(0, 10))
 
+        # Memory Status Pill (U2)
+        self.memory_status_label = customtkinter.CTkLabel(
+            controls_frame,
+            text="Memory: 0/4 turns",
+            font=NexusTheme.FONT_SMALL,
+            text_color=NexusTheme.TEXT_MUTED
+        )
+        self.memory_status_label.pack(side="left", padx=(0, 6))
+
+        # Clear Chat Button (U2)
+        self.clear_chat_btn = customtkinter.CTkButton(
+            controls_frame,
+            text="🧹 Clear Chat",
+            font=NexusTheme.FONT_SMALL,
+            width=85,
+            height=26,
+            fg_color=NexusTheme.SURFACE_ELEVATED,
+            hover_color=NexusTheme.ACCENT_CYAN_MUTED,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            command=self.clear_conversation
+        )
+        self.clear_chat_btn.pack(side="left", padx=(0, 10))
+
         # Include Chart Toggle
         self.chart_toggle_var = customtkinter.BooleanVar(value=False)
         self.chart_switch = customtkinter.CTkSwitch(
@@ -233,6 +280,96 @@ class ChatAnalystTab(customtkinter.CTkFrame):
         )
         self.copy_schema_btn.pack(side="left")
 
+    def _build_session_bar(self) -> None:
+        """Constructs compact session bar directly below the header bar."""
+        self.session_bar = customtkinter.CTkFrame(
+            self,
+            fg_color=NexusTheme.SURFACE_SLATE,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            border_width=NexusTheme.BORDER_WIDTH,
+            border_color=NexusTheme.SURFACE_BORDER,
+            height=34
+        )
+        self.session_bar.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=NexusTheme.PADDING_MD,
+            pady=(0, 4)
+        )
+
+        # Session Label
+        session_lbl = customtkinter.CTkLabel(
+            self.session_bar,
+            text="Session:",
+            font=NexusTheme.FONT_SMALL_BOLD,
+            text_color=NexusTheme.TEXT_SECONDARY
+        )
+        session_lbl.pack(side="left", padx=(NexusTheme.PADDING_SM, 6), pady=4)
+
+        # Dropdown
+        self.session_selector = customtkinter.CTkOptionMenu(
+            self.session_bar,
+            values=["New Session"],
+            font=NexusTheme.FONT_SMALL,
+            fg_color=NexusTheme.SURFACE_ELEVATED,
+            button_color=NexusTheme.ACCENT_CYAN_MUTED,
+            button_hover_color=NexusTheme.ACCENT_CYAN,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            width=240,
+            height=24,
+            command=self._on_session_dropdown_selected
+        )
+        self.session_selector.pack(side="left", padx=(0, 6), pady=4)
+
+        # + New Button
+        self.new_session_btn = customtkinter.CTkButton(
+            self.session_bar,
+            text="＋ New",
+            font=NexusTheme.FONT_SMALL,
+            width=65,
+            height=24,
+            fg_color=NexusTheme.SURFACE_ELEVATED,
+            hover_color=NexusTheme.ACCENT_CYAN_MUTED,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            command=lambda: self.start_new_session()
+        )
+        self.new_session_btn.pack(side="left", padx=(0, 6), pady=4)
+
+        # Rename Button
+        self.rename_session_btn = customtkinter.CTkButton(
+            self.session_bar,
+            text="✏️",
+            font=NexusTheme.FONT_SMALL,
+            width=32,
+            height=24,
+            fg_color=NexusTheme.SURFACE_ELEVATED,
+            hover_color=NexusTheme.ACCENT_CYAN_MUTED,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            command=self._handle_rename_session_click
+        )
+        self.rename_session_btn.pack(side="left", padx=(0, 6), pady=4)
+
+        # Delete Button
+        self.delete_session_btn = customtkinter.CTkButton(
+            self.session_bar,
+            text="🗑️",
+            font=NexusTheme.FONT_SMALL,
+            width=32,
+            height=24,
+            fg_color=NexusTheme.SURFACE_ELEVATED,
+            hover_color=NexusTheme.STATUS_CRIMSON,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            command=self._handle_delete_session_click
+        )
+        self.delete_session_btn.pack(side="left", padx=(0, 6), pady=4)
+
+        if self.session_store is None:
+            self.session_bar.grid_remove()
+
     def _build_chat_feed(self) -> None:
         self.chat_feed = customtkinter.CTkScrollableFrame(
             self,
@@ -241,8 +378,23 @@ class ChatAnalystTab(customtkinter.CTkFrame):
             border_width=NexusTheme.BORDER_WIDTH,
             border_color=NexusTheme.SURFACE_BORDER
         )
-        self.chat_feed.grid(row=1, column=0, sticky="nsew", padx=NexusTheme.PADDING_MD, pady=4)
+        self.chat_feed.grid(row=2, column=0, sticky="nsew", padx=NexusTheme.PADDING_MD, pady=4)
         self.chat_feed.grid_columnconfigure(0, weight=1)
+
+    def _build_starter_chips_bar(self) -> None:
+        """Row holding clickable zero-LLM starter question chips."""
+        self.starter_frame = customtkinter.CTkFrame(
+            self,
+            fg_color="transparent"
+        )
+        self.starter_frame.grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            padx=NexusTheme.PADDING_MD,
+            pady=(2, 2)
+        )
+        self._starter_buttons: List[customtkinter.CTkButton] = []
 
     def _build_input_bar(self) -> None:
         input_container = customtkinter.CTkFrame(
@@ -253,11 +405,11 @@ class ChatAnalystTab(customtkinter.CTkFrame):
             border_color=NexusTheme.SURFACE_BORDER
         )
         input_container.grid(
-            row=2,
+            row=4,
             column=0,
             sticky="ew",
             padx=NexusTheme.PADDING_MD,
-            pady=(8, NexusTheme.PADDING_MD)
+            pady=(4, NexusTheme.PADDING_MD)
         )
         input_container.grid_columnconfigure(0, weight=1)
 
@@ -509,6 +661,21 @@ class ChatAnalystTab(customtkinter.CTkFrame):
         llm_config = self._get_current_llm_config()
         request_chart_flag = True if self.chart_toggle_var.get() else None
 
+        # Auto-persist user message if session_store is present
+        if self.session_store is not None:
+            if not self._active_session_id:
+                s = self.session_store.create_session("New Session")
+                self._active_session_id = s.session_id
+            self.session_store.append_message(
+                self._active_session_id,
+                role="user",
+                natural_query=user_text,
+                status="SUBMITTED"
+            )
+
+        # Capture conversation history snapshot synchronously on main thread (Thread Safety)
+        history_snapshot = list(self._conversation_history)
+
         # Display live progress bubble
         self._post_progress_bubble(f"Synthesizing query via {llm_config.model}...")
 
@@ -522,7 +689,8 @@ class ChatAnalystTab(customtkinter.CTkFrame):
             result: AgentRunResult = chain.run(
                 natural_query=user_text,
                 request_chart=request_chart_flag,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                conversation_history=history_snapshot
             )
 
             # Safely render Matplotlib figure in worker thread
@@ -579,7 +747,42 @@ class ChatAnalystTab(customtkinter.CTkFrame):
 
         # Render response bubble per status
         status = result.status
+        if self.session_store is not None and self._active_session_id:
+            row_cnt = result.query_result.row_count if result.query_result else 0
+            self.session_store.append_message(
+                self._active_session_id,
+                role="assistant",
+                natural_query=result.natural_query,
+                generated_sql=result.generated_sql,
+                answer_markdown=result.answer_markdown,
+                status=result.status,
+                provider=result.provider,
+                model=result.model,
+                row_count=row_cnt,
+                execution_time_ms=result.total_latency_ms,
+                tables_used=result.tables_in_context
+            )
+            self.refresh_session_list()
+
         if status == "SUCCESS":
+            # Strict Memory Hygiene: only append SUCCESS turns into conversation history
+            turn = ConversationTurn(
+                natural_query=result.natural_query,
+                generated_sql=result.generated_sql,
+                answer_summary=result.answer_markdown[:240],
+                tables_used=result.tables_in_context
+            )
+            self._conversation_history.append(turn)
+            if len(self._conversation_history) > 10:
+                self._conversation_history = self._conversation_history[-10:]
+
+            disp_count = min(len(self._conversation_history), 4)
+            if hasattr(self, "memory_status_label") and self.memory_status_label.winfo_exists():
+                self.memory_status_label.configure(
+                    text=f"Memory: {disp_count}/4 turns",
+                    text_color=NexusTheme.ACCENT_CYAN if disp_count > 0 else NexusTheme.TEXT_MUTED
+                )
+
             self._render_success_bubble(result, figure)
         elif status == "SECURITY_BLOCKED":
             self._render_security_blocked_bubble(result)
@@ -615,6 +818,17 @@ class ChatAnalystTab(customtkinter.CTkFrame):
             status="LLM_ERROR",
             error_message=err_msg
         )
+        if self.session_store is not None and self._active_session_id:
+            self.session_store.append_message(
+                self._active_session_id,
+                role="assistant",
+                natural_query="",
+                generated_sql="",
+                answer_markdown=err_msg,
+                status="LLM_ERROR"
+            )
+            self.refresh_session_list()
+
         self._render_failed_bubble(failed_result)
         self._scroll_to_bottom()
 
@@ -633,7 +847,7 @@ class ChatAnalystTab(customtkinter.CTkFrame):
         )
         bubble.pack(fill="x", padx=(4, 60), pady=6, anchor="w")
 
-        # 1. Header (Emerald)
+        # 1. Header (Emerald) & Pruning Tag
         row_count = result.query_result.row_count if result.query_result else 0
         provider_tag = f"[{result.provider.upper()}]" if result.provider else ""
         header_text = (
@@ -648,6 +862,27 @@ class ChatAnalystTab(customtkinter.CTkFrame):
             anchor="w"
         )
         header.pack(fill="x", padx=12, pady=(10, 4))
+
+        if result.was_pruned:
+            pruned_tag = customtkinter.CTkLabel(
+                bubble,
+                text=f"⚡ Context Pruned: {len(result.tables_in_context)} tables",
+                font=NexusTheme.FONT_SMALL,
+                text_color=NexusTheme.ACCENT_CYAN,
+                anchor="w"
+            )
+            pruned_tag.pack(fill="x", padx=12, pady=(0, 4))
+
+        # Row-Cap Warning Badge (if query result was truncated for RAM safety)
+        if result.query_result and getattr(result.query_result, "truncated", False):
+            row_cap_badge = customtkinter.CTkLabel(
+                bubble,
+                text=f"⚠️ Results capped at {result.query_result.row_count:,} rows for RAM safety",
+                font=NexusTheme.FONT_SMALL,
+                text_color=NexusTheme.STATUS_AMBER,
+                anchor="w"
+            )
+            row_cap_badge.pack(fill="x", padx=12, pady=(2, 4))
 
         # 2. Executive Answer Markdown
         msg = customtkinter.CTkLabel(
@@ -700,9 +935,14 @@ class ChatAnalystTab(customtkinter.CTkFrame):
             )
             preview_title.pack(fill="x", padx=12, pady=(4, 2))
 
-            table_text = self._format_preview_table(result.query_result, limit=10)
+            table_text = format_ascii_table(
+                result.query_result.columns,
+                result.query_result.rows,
+                max_rows=10,
+                truncated=result.query_result.truncated
+            )
             table_lines = table_text.strip().count("\n") + 1
-            table_height = min(140, max(50, table_lines * 18 + 10))
+            table_height = min(180, max(50, table_lines * 18 + 10))
 
             table_box = customtkinter.CTkTextbox(
                 bubble,
@@ -744,7 +984,37 @@ class ChatAnalystTab(customtkinter.CTkFrame):
             corner_radius=NexusTheme.CORNER_RADIUS_SM,
             command=lambda sql=result.generated_sql, b=actions_frame: self._copy_sql_to_clipboard(sql)
         )
-        copy_btn.pack(side="left")
+        copy_btn.pack(side="left", padx=(0, 8))
+
+        export_csv_btn = customtkinter.CTkButton(
+            actions_frame,
+            text="📊 Export CSV",
+            font=NexusTheme.FONT_SMALL,
+            fg_color=NexusTheme.SURFACE_ELEVATED,
+            hover_color=NexusTheme.ACCENT_CYAN_MUTED,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            state="normal" if (result.query_result and result.query_result.row_count > 0) else "disabled",
+            command=lambda r=result: self._handle_chat_export_csv(r)
+        )
+        export_csv_btn.pack(side="left", padx=(0, 8))
+
+        export_brief_btn = customtkinter.CTkButton(
+            actions_frame,
+            text="📑 Export Brief",
+            font=NexusTheme.FONT_SMALL,
+            fg_color=NexusTheme.SURFACE_ELEVATED,
+            hover_color=NexusTheme.ACCENT_CYAN_MUTED,
+            text_color=NexusTheme.TEXT_PRIMARY,
+            corner_radius=NexusTheme.CORNER_RADIUS_SM,
+            command=lambda r=result, fig=figure: self._handle_chat_export_brief(r, fig)
+        )
+        export_brief_btn.pack(side="left")
+
+        actions_frame.export_csv_btn = export_csv_btn
+        actions_frame.export_brief_btn = export_brief_btn
+        self.export_csv_btn = export_csv_btn
+        self.export_brief_btn = export_brief_btn
 
         # 6. Embedded Matplotlib Dark Chart Card
         if figure is not None:
@@ -802,6 +1072,122 @@ class ChatAnalystTab(customtkinter.CTkFrame):
                 logger.info(f"Chart successfully saved to {path}")
         except Exception as exc:
             logger.error(f"Failed to save chart PNG: {exc}")
+
+    def _handle_chat_export_csv(self, result: AgentRunResult) -> None:
+        """Prompts for save path and asynchronously exports query result to CSV."""
+        if not result.query_result or result.query_result.row_count == 0:
+            return
+        file_path = filedialog.asksaveasfilename(
+            title="Export Query Result as CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV File", "*.csv"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+        self.export_result_csv(result, file_path)
+
+    def _handle_chat_export_brief(self, result: AgentRunResult, figure: Optional[Any] = None) -> None:
+        """Prompts for save path and asynchronously exports executive brief."""
+        file_path = filedialog.asksaveasfilename(
+            title="Export Executive Brief",
+            defaultextension=".html",
+            filetypes=[("Executive HTML Brief", "*.html"), ("Markdown Brief", "*.md"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+        self.export_executive_brief(result, file_path, figure=figure)
+
+    def export_result_csv(
+        self,
+        result: AgentRunResult,
+        output_path: Union[str, Path],
+        on_complete: Optional[Callable[[Path], None]] = None
+    ) -> None:
+        """
+        Exports the agent run result's query data to CSV.
+        Runs asynchronously if an AsyncWorkerManager is available, otherwise synchronously.
+        """
+        if result.query_result is None:
+            raise ValueError("Cannot export CSV: AgentRunResult has no query_result")
+
+        path_obj = Path(output_path)
+        cols = list(result.query_result.columns)
+        rows = list(result.query_result.rows)
+
+        def _worker_task() -> Path:
+            return DataExportEngine.export_csv(cols, rows, path_obj)
+
+        def _on_success(exported_path: Path) -> None:
+            logger.info(f"Chat result successfully exported to CSV: {exported_path}")
+            if callable(on_complete):
+                try:
+                    on_complete(exported_path)
+                except Exception as e:
+                    logger.warning(f"Error in on_complete callback: {e}")
+
+        def _on_error(exc: Exception) -> None:
+            logger.error(f"Failed to export chat result to CSV: {exc}")
+
+        if self.worker and not self.worker.is_shutdown:
+            self.worker.submit_task(
+                _worker_task,
+                on_success=_on_success,
+                on_error=_on_error,
+                task_name="ChatExportCSV"
+            )
+        else:
+            try:
+                res_path = _worker_task()
+                _on_success(res_path)
+            except Exception as exc:
+                _on_error(exc)
+                raise
+
+    def export_executive_brief(
+        self,
+        result: AgentRunResult,
+        output_path: Union[str, Path],
+        figure: Optional[Any] = None,
+        on_complete: Optional[Callable[[Path], None]] = None
+    ) -> None:
+        """
+        Exports an executive brief (HTML or Markdown) of the conversation turn.
+        Runs asynchronously if an AsyncWorkerManager is available, otherwise synchronously.
+        """
+        path_obj = Path(output_path)
+        ext = path_obj.suffix.lower()
+
+        def _worker_task() -> Path:
+            if ext in (".html", ".htm"):
+                return ExecutiveBriefExporter.export_html(result, path_obj, figure=figure)
+            else:
+                return ExecutiveBriefExporter.export_markdown(result, path_obj)
+
+        def _on_success(exported_path: Path) -> None:
+            logger.info(f"Executive brief successfully exported: {exported_path}")
+            if callable(on_complete):
+                try:
+                    on_complete(exported_path)
+                except Exception as e:
+                    logger.warning(f"Error in on_complete callback: {e}")
+
+        def _on_error(exc: Exception) -> None:
+            logger.error(f"Failed to export executive brief: {exc}")
+
+        if self.worker and not self.worker.is_shutdown:
+            self.worker.submit_task(
+                _worker_task,
+                on_success=_on_success,
+                on_error=_on_error,
+                task_name="ChatExportBrief"
+            )
+        else:
+            try:
+                res_path = _worker_task()
+                _on_success(res_path)
+            except Exception as exc:
+                _on_error(exc)
+                raise
 
     def _handle_open_in_explorer(self, sql: str) -> None:
         """Navigates to Data Explorer tab and loads the generated SQL."""
@@ -960,30 +1346,314 @@ class ChatAnalystTab(customtkinter.CTkFrame):
         """Formats QueryResult into a clean monospace text grid preview."""
         if not qr.columns or not qr.rows:
             return "(No data rows returned)"
+        return format_ascii_table(
+            columns=qr.columns,
+            rows=qr.rows,
+            max_rows=limit,
+            truncated=getattr(qr, "truncated", False)
+        )
 
-        cols = qr.columns
-        rows = qr.rows[:limit]
-        widths = {c: max(len(c), 6) for c in cols}
+    # --------------------------------------------------------------------------
+    # MULTI-TURN MEMORY & STARTER QUESTION CONTROLS (U2 & U2.5)
+    # --------------------------------------------------------------------------
 
-        for row in rows:
-            for idx, c in enumerate(cols):
-                val_str = str(row[idx]) if row[idx] is not None else "NULL"
-                widths[c] = min(max(widths[c], len(val_str)), 35)
+    def clear_conversation(self) -> None:
+        """
+        Public method to clear conversation memory and reset chat UI:
+        - If session_store is attached and current session already has messages, starts a clean
+          new session non-destructively so past saved sessions remain intact in the dropdown.
+        - Otherwise, clears conversation memory, active figures, and resets feed to welcome card.
+        """
+        if self.session_store is not None and self._active_session_id:
+            msgs = self.session_store.get_messages(self._active_session_id, limit=1)
+            if msgs:
+                self.start_new_session("New Session")
+                return
 
-        header = " | ".join(c.ljust(widths[c]) for c in cols)
-        divider = "-+-".join("-" * widths[c] for c in cols)
+        self._conversation_history.clear()
 
-        lines = [header, divider]
-        for row in rows:
-            row_parts = []
-            for idx, c in enumerate(cols):
-                val_str = str(row[idx]) if row[idx] is not None else "NULL"
-                if len(val_str) > 35:
-                    val_str = val_str[:32] + "..."
-                row_parts.append(val_str.ljust(widths[c]))
-            lines.append(" | ".join(row_parts))
+        # Deterministic cleanup of active figures (prevents GDI resource leaks)
+        for fig in self._embedded_figures:
+            try:
+                fig.clear()
+            except Exception:
+                pass
+        self._embedded_figures.clear()
 
-        return "\n".join(lines)
+        # Remove dynamic chat bubbles from scroll feed
+        for child in self.chat_feed.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+
+        # Reset memory status pill
+        if hasattr(self, "memory_status_label") and self.memory_status_label.winfo_exists():
+            self.memory_status_label.configure(
+                text="Memory: 0/4 turns",
+                text_color=NexusTheme.TEXT_MUTED
+            )
+
+        # Re-render welcome card
+        self._post_welcome_bubble()
+
+        # Refresh starter question chips
+        self.refresh_starter_questions()
+
+    # --------------------------------------------------------------------------
+    # MULTI-SESSION PERSISTENCE & RESTORATION (U4)
+    # --------------------------------------------------------------------------
+
+    def _initialize_sessions(self) -> None:
+        """Initializes multi-session state from session store."""
+        if self.session_store is None:
+            return
+        sessions = self.session_store.list_sessions(limit=50)
+        if sessions:
+            self.load_session(sessions[0].session_id)
+        else:
+            new_sess = self.session_store.create_session("New Session")
+            self.load_session(new_sess.session_id)
+
+    def refresh_session_list(self) -> None:
+        """Refreshes the session selector dropdown with current sessions."""
+        if self.session_store is None:
+            return
+        sessions = self.session_store.list_sessions(limit=50)
+        self._session_label_to_id.clear()
+        labels: List[str] = []
+        for s in sessions:
+            base_label = f"{s.title} ({s.message_count} msgs)"
+            label = base_label
+            if label in self._session_label_to_id:
+                label = f"{s.title} ({s.message_count} msgs) #{s.session_id[:4]}"
+            self._session_label_to_id[label] = s.session_id
+            labels.append(label)
+
+        if not labels:
+            labels = ["New Session"]
+
+        if hasattr(self, "session_selector") and self.session_selector.winfo_exists():
+            self.session_selector.configure(values=labels)
+            if self._active_session_id:
+                matching = [lbl for lbl, sid in self._session_label_to_id.items() if sid == self._active_session_id]
+                if matching:
+                    self.session_selector.set(matching[0])
+                elif labels:
+                    self.session_selector.set(labels[0])
+
+    def _on_session_dropdown_selected(self, chosen_label: str) -> None:
+        """Handles session dropdown selection change."""
+        sess_id = self._session_label_to_id.get(chosen_label)
+        if sess_id and sess_id != self._active_session_id:
+            self.load_session(sess_id)
+
+    def load_session(self, session_id: str) -> None:
+        """
+        Loads and renders a session:
+        - Clears embedded figures (prevents GDI leaks)
+        - Clears message feed
+        - Sets active session ID
+        - Restores chat bubbles
+        - Restores verified SUCCESS memory turns into self._conversation_history
+        - Syncs dropdown and starter chips
+        """
+        # Clear embedded figures
+        for fig in self._embedded_figures:
+            try:
+                fig.clear()
+            except Exception:
+                pass
+        self._embedded_figures.clear()
+
+        # Clear existing dynamic chat bubbles
+        for child in self.chat_feed.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+
+        self._active_session_id = session_id
+
+        if self.session_store is not None:
+            messages = self.session_store.get_messages(session_id)
+            if not messages:
+                self._post_welcome_bubble()
+            else:
+                for m in messages:
+                    if m.role == "user":
+                        self._post_user_bubble(m.natural_query or "")
+                    else:
+                        res = AgentRunResult(
+                            natural_query=m.natural_query or "",
+                            generated_sql=m.generated_sql or "",
+                            answer_markdown=m.answer_markdown or "",
+                            status=m.status,
+                            provider=m.provider or "",
+                            model=m.model or "",
+                            query_result=QueryResult(
+                                columns=[],
+                                rows=[],
+                                row_count=m.row_count,
+                                execution_time_ms=m.execution_time_ms,
+                                sql=m.generated_sql or ""
+                            ),
+                            total_latency_ms=m.execution_time_ms,
+                            tables_in_context=m.tables_used
+                        )
+                        if m.status == "SUCCESS":
+                            self._render_success_bubble(res, figure=None)
+                        elif m.status == "SECURITY_BLOCKED":
+                            self._render_security_blocked_bubble(res)
+                        elif m.status == "EMPTY_DB":
+                            self._render_empty_db_bubble(res)
+                        else:
+                            self._render_failed_bubble(res)
+
+            # Strict Memory Hygiene: only SUCCESS turns enter _conversation_history
+            self._conversation_history = list(self.session_store.load_conversation_turns(session_id, limit=4))
+            disp_count = min(len(self._conversation_history), 4)
+            if hasattr(self, "memory_status_label") and self.memory_status_label.winfo_exists():
+                self.memory_status_label.configure(
+                    text=f"Memory: {disp_count}/4 turns",
+                    text_color=NexusTheme.ACCENT_CYAN if disp_count > 0 else NexusTheme.TEXT_MUTED
+                )
+            self.refresh_session_list()
+        else:
+            self._post_welcome_bubble()
+
+        self.refresh_starter_questions()
+        self._scroll_to_bottom()
+
+    def start_new_session(self, title: str = "New Session") -> Optional[str]:
+        """Creates a new session in session store and loads it."""
+        if self.session_store is None:
+            self.clear_conversation()
+            return None
+        sess = self.session_store.create_session(title=title)
+        self.load_session(sess.session_id)
+        return sess.session_id
+
+    def rename_active_session(self, new_title: str) -> bool:
+        """Renames the active session in session store and refreshes selector."""
+        if self.session_store is None or not self._active_session_id:
+            return False
+        ok = self.session_store.rename_session(self._active_session_id, new_title)
+        if ok:
+            self.refresh_session_list()
+        return ok
+
+    def _handle_rename_session_click(self) -> None:
+        """Opens CTkInputDialog to prompt user for a new session title."""
+        dialog = customtkinter.CTkInputDialog(
+            text="Enter new session title:",
+            title="Rename Session"
+        )
+        new_title = dialog.get_input()
+        if new_title and new_title.strip():
+            self.rename_active_session(new_title.strip())
+
+    def delete_active_session(self) -> bool:
+        """Deletes active session and cascades associated messages."""
+        if self.session_store is None or not self._active_session_id:
+            return False
+        target_id = self._active_session_id
+        ok = self.session_store.delete_session(target_id)
+        if not ok:
+            return False
+        remaining = self.session_store.list_sessions(limit=50)
+        if remaining:
+            self.load_session(remaining[0].session_id)
+        else:
+            new_sess = self.session_store.create_session("New Session")
+            self.load_session(new_sess.session_id)
+        return True
+
+    def _handle_delete_session_click(self) -> None:
+        """Prompts confirmation dialog before deleting active session."""
+        from tkinter import messagebox
+        confirmed = messagebox.askyesno(
+            title="Confirm Delete Session",
+            message="Are you sure you want to permanently delete this chat session?\nAll associated messages will be deleted."
+        )
+        if confirmed:
+            self.delete_active_session()
+
+    def refresh_starter_questions(self) -> None:
+        """
+        Asynchronously queries schema to generate up to 3 starter questions
+        with zero GUI thread blocking.
+        """
+        def _fetch_questions() -> List[str]:
+            return generate_starter_questions(self.schema_parser, max_questions=3)
+
+        def _on_success(questions: List[str]) -> None:
+            if not self.winfo_exists():
+                return
+            self.set_starter_questions(questions)
+
+        def _on_error(exc: Exception) -> None:
+            logger.debug(f"Failed to generate starter questions: {exc}")
+            if self.winfo_exists():
+                self.set_starter_questions([])
+
+        if self.worker and not self.worker.is_shutdown:
+            self.worker.submit_task(
+                _fetch_questions,
+                on_success=_on_success,
+                on_error=_on_error,
+                task_name="GenerateStarterQuestions"
+            )
+        else:
+            try:
+                qs = _fetch_questions()
+                _on_success(qs)
+            except Exception as e:
+                _on_error(e)
+
+    def set_starter_questions(self, questions: List[str]) -> None:
+        """
+        Renders up to 3 concise, clickable starter question chips.
+        If questions is empty, hides starter_frame.
+        """
+        if not self.winfo_exists():
+            return
+
+        for btn in self._starter_buttons:
+            try:
+                btn.destroy()
+            except Exception:
+                pass
+        self._starter_buttons.clear()
+
+        clean_questions = [q.strip() for q in questions if q and q.strip()][:3]
+        if not clean_questions:
+            self.starter_frame.grid_remove()
+            return
+
+        self.starter_frame.grid()
+        for q in clean_questions:
+            btn = customtkinter.CTkButton(
+                self.starter_frame,
+                text=f"💡 {q}",
+                font=NexusTheme.FONT_SMALL,
+                fg_color=NexusTheme.SURFACE_SLATE,
+                hover_color=NexusTheme.ACCENT_CYAN_MUTED,
+                text_color=NexusTheme.ACCENT_CYAN,
+                border_width=1,
+                border_color=NexusTheme.SURFACE_BORDER,
+                corner_radius=NexusTheme.CORNER_RADIUS_SM,
+                height=26,
+                command=lambda prompt=q: self._handle_starter_click(prompt)
+            )
+            btn.pack(side="left", padx=(0, 8), pady=2)
+            self._starter_buttons.append(btn)
+
+    def _handle_starter_click(self, prompt: str) -> None:
+        """Populates query entry and immediately sends the query."""
+        self.query_entry.delete(0, "end")
+        self.query_entry.insert(0, prompt)
+        self.send_user_message()
 
     # --------------------------------------------------------------------------
     # SCHEMA CONTEXT CLIPBOARD UTILITY

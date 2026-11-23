@@ -5,6 +5,7 @@
 
 # Data Processing & Vectorized Operations
 pandas>=2.2.0
+openpyxl>=3.1.0
 
 # LLM & Text-to-SQL Orchestration
 langchain>=0.2.0

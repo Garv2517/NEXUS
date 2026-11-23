@@ -3,7 +3,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011%20PowerShell-blue?logo=windows)](https://microsoft.com)
 [![Python Runtime](https://img.shields.io/badge/Python-3.13.2-3776AB?logo=python&logoColor=white)](https://python.org)
 [![Build Packaging](https://img.shields.io/badge/Packaging-PyInstaller%20Standalone-FFD43B?logo=pypi)](https://pyinstaller.org)
-[![Test Suite](https://img.shields.io/badge/Tests-149%2F149%20Passing%20(100%25)-success?logo=pytest)](file:///tests)
+[![Test Suite](https://img.shields.io/badge/Tests-195%2F195%20Passing%20(100%25)-success?logo=pytest)](file:///tests)
 [![Security Policy](https://img.shields.io/badge/QueryGuard-8--Layer%20Airgap-red)](file:///src/core/query_guard.py)
 [![UI Framework](https://img.shields.io/badge/UI-CustomTkinter%20Dark-2b2b2b)](file:///src/ui)
 [![Database Engine](https://img.shields.io/badge/Database-SQLite3%20WAL%20Mode-003B57?logo=sqlite)](file:///src/core/db_manager.py)
@@ -16,17 +16,18 @@
 
 ## 📑 Table of Contents
 1. [Executive Summary](#executive-summary)
-2. [Architectural Overview & System Topology](#architectural-overview--system-topology)
-3. [The 8-Layer QueryGuard Security Architecture](#the-8-layer-queryguard-security-architecture)
-4. [High-Throughput Chunked ETL Engine](#high-throughput-chunked-etl-engine)
-5. [Zero-Bloat Hybrid LLM Router & Privacy Architecture](#zero-bloat-hybrid-llm-router--privacy-architecture)
-6. [Resilient Self-Healing Text-to-SQL Pipeline](#resilient-self-healing-text-to-sql-pipeline)
-7. [Zero-Eval Object-Oriented Visualizer](#zero-eval-object-oriented-visualizer)
-8. [Freeze-Safe Standalone Desktop Packaging](#freeze-safe-standalone-desktop-packaging)
-9. [Automated Verification & Test Ledger](#automated-verification--test-ledger)
-10. [Hardware Specifications & Local Performance](#hardware-specifications--local-performance)
-11. [Installation, Build & CLI Reference](#installation-build--cli-reference)
-12. [License & Engineering Supervision](#license--engineering-supervision)
+2. [What's New in v1.1.0](#whats-new-in-v110)
+3. [Architectural Overview & System Topology](#architectural-overview--system-topology)
+4. [The 8-Layer QueryGuard Security Architecture](#the-8-layer-queryguard-security-architecture)
+5. [High-Throughput Chunked ETL Engine](#high-throughput-chunked-etl-engine)
+6. [Zero-Bloat Hybrid LLM Router & Privacy Architecture](#zero-bloat-hybrid-llm-router--privacy-architecture)
+7. [Resilient Self-Healing Text-to-SQL Pipeline](#resilient-self-healing-text-to-sql-pipeline)
+8. [Zero-Eval Object-Oriented Visualizer](#zero-eval-object-oriented-visualizer)
+9. [Freeze-Safe Standalone Desktop Packaging](#freeze-safe-standalone-desktop-packaging)
+10. [Automated Verification & Test Ledger](#automated-verification--test-ledger)
+11. [Hardware Specifications & Local Performance](#hardware-specifications--local-performance)
+12. [Installation, Build & CLI Reference](#installation-build--cli-reference)
+13. [License & Engineering Supervision](#license--engineering-supervision)
 
 ---
 
@@ -44,6 +45,39 @@ Modern desktop analytical tools often suffer from three fatal flaws:
 - **Extreme Local Speed**: Ingests **100,000 messy CSV rows in 1.18 seconds** (~84,745 rows/sec) directly into a concurrent SQLite Write-Ahead Logging (WAL) database.
 - **Freeze-Safe Persistence**: Features an intelligent runtime path virtualization system providing persistent `%LOCALAPPDATA%\NEXUS\data` storage and zero-dependency `--portable` USB execution.
 - **Hybrid AI Autonomy**: Runs 100% offline via local VRAM-resident Ollama models (`phi4-mini`, `granite4.1:3b`) on consumer GPUs, with optional zero-leakage cloud fallback (Gemini, Claude).
+
+---
+
+## What's New in v1.1.0
+
+The **NEXUS v1.1.0** release delivers four comprehensive architectural upgrades (U1 through U4), expanding the platform from a single-turn Text-to-SQL tool into a complete enterprise-grade desktop data engineering and session-managed analytics suite.
+
+### 🔬 Upgrade U1 & U1.5 — AI Dataset Profiler & Interactive Cleaning Modal
+- **Heuristic & Local LLM AI Profiler** (`src/etl/ai_profiler.py`): Ingests the first 1,000 rows without multi-pass disk I/O, generating deterministic statistical profiles (null percentages, unique ratios, ragged whitespace, mixed date formats, numeric anomalies).
+- **Zero-Leakage PII Defense**: Scans datasets for sensitive patterns (`EMAIL`, `PHONE`, `SSN`, `CREDIT_CARD`) with strict regex masking before any prompt reaches local or cloud models.
+- **Cyber-Analytics Cleaning Plan Modal** (`src/ui/components/cleaning_modal.py`): Non-blocking CustomTkinter modal displaying an interactive step-by-step checklist. Users can toggle individual cleaning steps, inspect PII alerts, skip straight to raw ingestion, or cancel with zero database mutations.
+- **Graceful Offline Fallback**: Generates high-confidence rule-based cleaning plans when local Ollama models are offline.
+
+### 🧠 Upgrade U2 & U2.5 — Multi-Turn Conversation Memory, 4GB VRAM Pruning & Safe Row Capping
+- **Bounded Multi-Turn Conversation Memory**: Maintains up to 4 conversational turns (`ConversationTurn`) for natural follow-up queries (e.g., *"Filter that by North America"* or *"Sort descending"*). Failed or blocked queries are strictly quarantined from memory.
+- **Deterministic 4GB VRAM Schema Pruning**: Scans user questions against database tables and automatically expands Foreign Key relationships, reducing prompt token footprints by up to 70% to prevent GPU context overflow on 4GB VRAM laptops.
+- **Zero-LLM Starter Questions**: Instantly synthesizes 3-4 natural language starter query chips upon dataset ingestion without consuming AI tokens or blocking the main thread.
+- **Safe Row-Cap Guard** (`src/core/db_manager.py`): Implements O(1) RAM consumption via `cursor.fetchmany()` with a configurable `max_rows` cap (default 10,000) and `QueryResult.truncated` tracking to eliminate Out-Of-Memory (OOM) crashes on large tables.
+- **Executive IEEE-754 & Numeric Formatter** (`src/ui/formatters.py`): High-precision financial and scientific notation formatting across chat responses and tabular inspectors.
+
+### 📊 Upgrade U3 & U3.5 — Data Explorer Table Manager, Multi-Sheet Excel & OWASP Export Engine
+- **Dark Cyber-Analytics ttk.Treeview Grid**: Sortable, searchable data grid styled with CustomTkinter obsidian/cyan palette tokens, dynamic 1,000-row preview pagination, and instant column sorting.
+- **Full-Lifecycle Table Manager** (`src/core/table_manager.py`): Schema inspection, live row counts, and confirmation-gated Drop and Rename operations with reserved namespace protection (`_nexus_*`, `sqlite_*`).
+- **Multi-Sheet Excel Workbook Preview** (`src/ui/components/sheet_picker_modal.py`): Allows users to inspect and select individual worksheets when importing `.xlsx` files via `openpyxl`.
+- **Enterprise OWASP-Guarded Export Engine** (`src/core/export_engine.py`):
+  - **Formula Injection Immunity**: Neutralizes spreadsheet formula injection risks (`=`, `+`, `-`, `@`, `\t`, `\r`) with single-quote escaping on CSV and `.xlsx` exports.
+  - **Self-Contained Executive HTML Brief**: Compiles executive HTML summaries complete with sanitized tables and base64-embedded high-DPI Matplotlib visualizations.
+  - **Standalone JSON Export**: Clean JSON recordset export for external analytics pipelines.
+
+### 🔐 Upgrade U4 — Native Windows DPAPI Key Vault & Persistent Session Store
+- **Hardware/User-Bound Windows DPAPI Vault** (`src/core/key_vault.py`): Zero-dependency native Win32 encryption via stdlib `ctypes` (`CryptProtectData` / `CryptUnprotectData`). API keys (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`) are encrypted specifically for the current Windows user profile.
+- **Opt-In Key Vault UI Toggle**: Users can toggle DPAPI persistence in the Sidebar. Unchecked vault mode defaults to volatile RAM-only storage. Zero plaintext secrets are ever written to disk, SQLite, or logs.
+- **Persistent SQLite Session Store** (`src/core/session_store.py`): Multi-session persistence with automatic thread titling from initial queries, Foreign Key cascading, dynamic session switching, and strict SUCCESS-only memory restoration.
 
 ---
 
@@ -270,14 +304,14 @@ excludes = [
 
 **Resulting Bundle Metrics**:
 - **Unoptimized Baseline**: ~4.2 GB (bloated with PyTorch CUDA binaries)
-- **Hardened NEXUS Standalone Directory**: **233.45 MB total bundle** (`NEXUS.exe`: 26.37 MB)
+- **Hardened NEXUS Standalone Directory**: **233.59 MB total bundle** (`NEXUS.exe`: 26.47 MB, Installer: 70.20 MB)
 - **Cold-Start Launch Time**: **0.82 seconds** on local NVMe SSD.
 
 ---
 
 ## Automated Verification & Test Ledger
 
-NEXUS enforces a strict **4-Step Verification Gate** (Prompt Generation -> Line-by-Line Code Audit -> Master Remediation -> Automated Testing). All 149 automated tests pass with 100% reliability.
+NEXUS enforces a strict **4-Step Verification Gate** (Prompt Generation -> Line-by-Line Code Audit -> Master Remediation -> Automated Testing). All **195 automated tests pass with 100% reliability across 18 test suites**.
 
 ### Verified Test Suite Breakdown
 
@@ -287,13 +321,21 @@ NEXUS enforces a strict **4-Step Verification Gate** (Prompt Generation -> Line-
 | `tests/test_security.py` | QueryGuard 8-layer filter, adversarial SQLi, C-authorizer | **28** | 100% | 0.82s |
 | `tests/test_core.py` | WAL mode, thread-local reads, audit ledger, schema parser | **9** | 100% | 0.64s |
 | `tests/test_etl.py` | 100k row benchmark, sanitization, JSON cleaning plans | **22** | 100% | 2.45s |
+| `tests/test_ai_profiler.py` | AI profiler, regex PII detection, heuristic fallback | **7** | 100% | 0.40s |
 | `tests/test_llm_router.py` | Ollama/Gemini/Claude, RFC 1918 B310 guard, secret masking | **16** | 100% | 0.18s |
 | `tests/test_agent_pipeline.py` | SQL extraction, <think> strip, ChartSpec, self-healing | **22** | 100% | 1.12s |
+| `tests/test_u2_memory_and_pruning.py` | Bounded multi-turn memory, schema pruning, row-cap guard | **7** | 100% | 0.25s |
+| `tests/test_u3_export_and_table_mgr.py` | OWASP formula injection, Excel sheets, TableManager | **5** | 100% | 0.35s |
+| `tests/test_u4_vault_and_sessions.py` | Windows DPAPI vault, SessionStore, FK cascade, titling | **6** | 100% | 0.30s |
 | `tests/test_ui_foundation.py` | NexusTheme immutability, mask_secret, AsyncWorker queue | **12** | 100% | 0.42s |
 | `tests/test_ui_components.py` | Sidebar, DataExplorer, TelemetryHUD, ChatAnalyst tabs | **10** | 100% | 3.89s |
+| `tests/test_u1_cleaning_modal.py` | Interactive cleaning modal, checkbox apply, skip/cancel | **6** | 100% | 1.85s |
+| `tests/test_u2_ui_integration.py` | Chat memory pill, clear chat, starter chips, formatters | **5** | 100% | 1.90s |
+| `tests/test_u3_ui_integration.py` | Treeview grid, Table Manager UI, Export modal, Sheet picker | **5** | 100% | 2.10s |
+| `tests/test_u4_ui_integration.py` | DPAPI sidebar toggle, session switcher, persistence UI | **5** | 100% | 2.05s |
 | `tests/test_phase4_ui_integration.py` | Live Text-to-SQL UI, embedded charts, Explorer handoff | **10** | 100% | 5.21s |
 | `tests/test_ui_app.py` | App lifecycle, tab routing, keyboard shortcuts, smoke test | **8** | 100% | 4.88s |
-| **TOTAL** | **Comprehensive System Validation** | **149** | **100%** | **~25.8s** |
+| **TOTAL** | **Comprehensive System Validation (18 Test Suites)** | **195** | **100%** | **~28.8s** |
 
 ---
 
@@ -317,8 +359,8 @@ All performance benchmarks and execution timing were validated on the following 
 
 ### Download & Install (Windows — No Python or Terminal Required)
 
-1. Go to the **Releases** page on the right and download **`NEXUS-Setup-v1.0.0.exe`**.
-2. Double-click **`NEXUS-Setup-v1.0.0.exe`** and follow the setup wizard.
+1. Go to the **Releases** page on the right and download **`NEXUS-Setup-v1.1.0.exe`**.
+2. Double-click **`NEXUS-Setup-v1.1.0.exe`** and follow the setup wizard.
 3. Launch **NEXUS** from your Desktop or Start Menu.
 
 > **Optional Note**: For offline local AI, install Ollama from [ollama.com](https://ollama.com); CSV ingestion, SQL Explorer, Telemetry HUD, and Cloud Gemini/Claude mode work immediately with zero extra setup.
@@ -341,7 +383,7 @@ python -m venv venv
 # Install pinned dependencies
 pip install -r requirements.txt
 
-# Execute full automated test suite (149 tests)
+# Execute full automated test suite (195 tests)
 python -m pytest
 ```
 
@@ -356,7 +398,7 @@ NEXUS includes an automated PowerShell build pipeline (`scripts/build_exe.ps1`):
 # Clean previous builds and compile single-file portable binary (dist\NEXUS.exe)
 .\scripts\build_exe.ps1 -Mode onefile -Clean -SmokeTest
 
-# Build standalone executable AND Inno Setup Windows installer (dist\installer\NEXUS-Setup-v1.0.0.exe)
+# Build standalone executable AND Inno Setup Windows installer (dist\installer\NEXUS-Setup-v1.1.0.exe)
 .\scripts\build_exe.ps1 -BuildInstaller
 ```
 
