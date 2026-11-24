@@ -17,17 +17,19 @@
 ## 📑 Table of Contents
 1. [Executive Summary](#executive-summary)
 2. [What's New in v1.1.0](#whats-new-in-v110)
-3. [Architectural Overview & System Topology](#architectural-overview--system-topology)
-4. [The 8-Layer QueryGuard Security Architecture](#the-8-layer-queryguard-security-architecture)
-5. [High-Throughput Chunked ETL Engine](#high-throughput-chunked-etl-engine)
-6. [Zero-Bloat Hybrid LLM Router & Privacy Architecture](#zero-bloat-hybrid-llm-router--privacy-architecture)
-7. [Resilient Self-Healing Text-to-SQL Pipeline](#resilient-self-healing-text-to-sql-pipeline)
-8. [Zero-Eval Object-Oriented Visualizer](#zero-eval-object-oriented-visualizer)
-9. [Freeze-Safe Standalone Desktop Packaging](#freeze-safe-standalone-desktop-packaging)
-10. [Automated Verification & Test Ledger](#automated-verification--test-ledger)
-11. [Hardware Specifications & Local Performance](#hardware-specifications--local-performance)
-12. [Installation, Build & CLI Reference](#installation-build--cli-reference)
-13. [License & Engineering Supervision](#license--engineering-supervision)
+3. [Download & Install](#download--install-windows--no-python-or-terminal-required)
+4. [Interface & Security Showcase](#interface--security-showcase)
+5. [Architectural Overview & System Topology](#architectural-overview--system-topology)
+6. [The 8-Layer QueryGuard Security Architecture](#the-8-layer-queryguard-security-architecture)
+7. [High-Throughput Chunked ETL Engine](#high-throughput-chunked-etl-engine)
+8. [Zero-Bloat Hybrid LLM Router & Privacy Architecture](#zero-bloat-hybrid-llm-router--privacy-architecture)
+9. [Resilient Self-Healing Text-to-SQL Pipeline](#resilient-self-healing-text-to-sql-pipeline)
+10. [Zero-Eval Object-Oriented Visualizer](#zero-eval-object-oriented-visualizer)
+11. [Freeze-Safe Standalone Desktop Packaging](#freeze-safe-standalone-desktop-packaging)
+12. [Automated Verification & Test Ledger](#automated-verification--test-ledger)
+13. [Hardware Specifications & Local Performance](#hardware-specifications--local-performance)
+14. [Developer Setup, Build & CLI Reference](#developer-setup-build--cli-reference)
+15. [License & Engineering Supervision](#license--engineering-supervision)
 
 ---
 
@@ -81,6 +83,42 @@ The **NEXUS v1.1.0** release delivers four comprehensive architectural upgrades 
 
 ---
 
+## Download & Install (Windows — No Python or Terminal Required)
+
+1. Go to the **Releases** page on the right and download **`NEXUS-Setup-v1.1.0.exe`**.
+2. Double-click **`NEXUS-Setup-v1.1.0.exe`** and follow the setup wizard (per-user installation, no administrator privileges required).
+3. Launch **NEXUS** from your Desktop or Start Menu.
+
+> **Optional Note**: For offline local AI, install Ollama from [ollama.com](https://ollama.com); CSV ingestion, SQL Explorer, Telemetry HUD, and Cloud Gemini/Claude mode work immediately with zero extra setup.
+
+---
+
+## Interface & Security Showcase
+
+### AI Analyst Chat: Multi-Turn Memory, Starter Chips & Embedded Dark Matplotlib Chart
+![AI Analyst Chat: Multi-Turn Memory, Starter Chips & Embedded Dark Matplotlib Chart](docs/screenshots/ai_analyst_chart.png)
+*`docs/screenshots/ai_analyst_chart.png` — AI Analyst Chat: Multi-Turn Memory, Starter Chips & Embedded Dark Matplotlib Chart*
+
+---
+
+### Live Prompt-Injection Deflection: 8-Layer QueryGuard Blocking an LLM-Generated DELETE (0 Retries)
+![Live Prompt-Injection Deflection: 8-Layer QueryGuard Blocking an LLM-Generated DELETE (0 Retries)](docs/screenshots/queryguard_block.png)
+*`docs/screenshots/queryguard_block.png` — Live Prompt-Injection Deflection: 8-Layer QueryGuard Blocking an LLM-Generated DELETE (0 Retries)*
+
+---
+
+### Data Explorer: Sortable/Searchable Cyber Grid, Guarded SQL Scratchpad & Formula-Safe CSV/Excel Export
+![Data Explorer: Sortable/Searchable Cyber Grid, Guarded SQL Scratchpad & Formula-Safe CSV/Excel Export](docs/screenshots/data_explorer_grid.png)
+*`docs/screenshots/data_explorer_grid.png` — Data Explorer: Sortable/Searchable Cyber Grid, Guarded SQL Scratchpad & Formula-Safe CSV/Excel Export*
+
+---
+
+### Autonomous AI Smart Clean: 0–100 Data Health Scorecard, Pre-LLM PII Shield & Step Approval Modal
+![Autonomous AI Smart Clean: 0–100 Data Health Scorecard, Pre-LLM PII Shield & Step Approval Modal](docs/screenshots/ai_smart_clean_modal.png)
+*`docs/screenshots/ai_smart_clean_modal.png` — Autonomous AI Smart Clean: 0–100 Data Health Scorecard, Pre-LLM PII Shield & Step Approval Modal*
+
+---
+
 ## Architectural Overview & System Topology
 
 The NEXUS architecture decouples asynchronous UI rendering from heavy data engineering workloads, sandboxing all query synthesis behind an immutable validation pipeline:
@@ -90,20 +128,24 @@ flowchart TD
     subgraph UI_Layer ["Desktop Presentation Layer (CustomTkinter)"]
         UI_Root["NexusApp Shell (Window Engine)"]
         Sidebar["Sidebar Dropzone & Model Picker"]
-        Explorer["Data Explorer & SQL Scratchpad"]
+        Explorer["Data Explorer & Table Manager"]
         Chat["Chat Analyst & Embedded Canvas"]
         HUD["Telemetry HUD & Audit Ledger"]
+        Modal["AI Cleaning & Sheet Preview Modals"]
     end
 
-    subgraph Async_Bridge ["Concurreny & Dispatch Engine"]
+    subgraph Async_Bridge ["Concurrency & Dispatch Engine"]
         Worker["AsyncWorker (ThreadPoolExecutor x4)"]
         EventQ["Event Queue & Mainloop Poller (30ms)"]
     end
 
     subgraph Data_Pipeline ["Core Data & Storage Engine"]
+        Profiler["AI Profiler & PII Shield (src/etl/ai_profiler.py)"]
         ETL["Chunked ETL Engine (Pandas Vectorized)"]
         DB["DatabaseManager (SQLite3 WAL Mode)"]
         Schema["Streaming Schema Parser & FK Graph"]
+        Sessions["Chat Session Store (Cascading SQLite FK)"]
+        Export["DataExport & Executive Brief Engine"]
     end
 
     subgraph Security_Gate ["QueryGuard Airgap (src/core/query_guard.py)"]
@@ -117,32 +159,50 @@ flowchart TD
         L8["L8: Isolated EXPLAIN Plan Check"]
     end
 
-    subgraph Agent_Core ["Autonomous Agent & Visualization"]
+    subgraph Agent_Core ["Autonomous Agent & Security Vault"]
+        Vault["Windows DPAPI Key Vault (Native Win32 ctypes)"]
         Router["LLM Router (Ollama / Gemini / Claude)"]
-        SQLChain["SQLAgentChain (Self-Healing Loop)"]
+        SQLChain["SQLAgentChain (Self-Healing Loop & Bounded Memory)"]
         Chart["ChartEngine (Pydantic ChartSpec -> OO Matplotlib)"]
     end
 
-    %% Flow connections
-    Sidebar -->|Raw CSV Drop| Worker
-    Worker -->|Ingestion Task| ETL
-    ETL -->|Bulk Insert| DB
-    DB -->|Metadata| Schema
-    Schema -->|Context Injection| SQLChain
+    %% Ingestion & Profiling Flow
+    Sidebar -->|"Raw CSV / Excel File Drop"| Worker
+    Worker -->|"First 1,000 Rows Profiling & PII Scan"| Profiler
+    Profiler -->|"Generated Cleaning Plan"| Modal
+    Modal -->|"User-Approved Cleaning Directives"| ETL
+    ETL -->|"Bulk Batch Insert"| DB
+    DB -->|"Table Metadata & FK Topology"| Schema
+    Schema -->|"Deterministic Pruned Schema Context"| SQLChain
 
-    Chat -->|Natural Language Prompt| Worker
-    Worker -->|Synthesis Request| Router
-    Router -->|Raw SQL Output| SQLChain
-    SQLChain -->|Validation Check| Security_Gate
-    Security_Gate -->|Verdict: PASS| DB
-    Security_Gate -->|Verdict: BLOCKED (0 Retries)| Chat
+    %% Security & Key Vault Integration
+    Vault -->|"Hardware/User-Bound Key Decryption"| Router
 
-    DB -->|Recordsets| Chart
-    Chart -->|TkAgg Canvas| Chat
-    Explorer -->|Guarded Scratchpad Execution| Security_Gate
-    Security_Gate -->|Telemetry Audit Event| HUD
-    Worker -->|Thread-Safe Progress| EventQ
-    EventQ -->|30ms Sync| UI_Root
+    %% Synthesis & QueryGuard Security Gate Flow
+    Chat -->|"Natural Language Prompt"| Worker
+    Worker -->|"Bounded History & Synthesis Request"| Router
+    Router -->|"Raw SQL Candidate"| SQLChain
+    SQLChain -->|"Validation Intercept"| Security_Gate
+    Security_Gate -->|"Verdict: PASS"| DB
+    Security_Gate -->|"Verdict: BLOCKED (0 Retries)"| Chat
+    Security_Gate -->|"Telemetry Audit Event"| HUD
+
+    %% Visualization & Analytics
+    DB -->|"Sanitized Recordsets"| Chart
+    Chart -->|"TkAgg Dark Mode Canvas"| Chat
+
+    %% Session Persistence
+    SQLChain -->|"Persist Active Turns (SUCCESS Only)"| Sessions
+    Sessions -->|"Restore Session History"| Chat
+
+    %% Explorer, Table Manager & Export
+    Explorer -->|"Guarded Scratchpad Execution"| Security_Gate
+    Explorer -->|"Formula-Safe Export Request (CSV/XLSX/HTML)"| Export
+    Export -->|"Sanitized File / Executive Brief"| Explorer
+
+    %% UI Synchronization
+    Worker -->|"Thread-Safe Progress Dispatch"| EventQ
+    EventQ -->|"30ms Main-Thread Polling"| UI_Root
 ```
 
 ---
@@ -355,18 +415,12 @@ All performance benchmarks and execution timing were validated on the following 
 
 ---
 
-## Installation, Build & CLI Reference
+## Developer Setup, Build & CLI Reference
 
-### Download & Install (Windows — No Python or Terminal Required)
+> For single-click Windows desktop installation, see the [Download & Install](#download--install-windows--no-python-or-terminal-required) guide near the top of this page.
 
-1. Go to the **Releases** page on the right and download **`NEXUS-Setup-v1.1.0.exe`**.
-2. Double-click **`NEXUS-Setup-v1.1.0.exe`** and follow the setup wizard.
-3. Launch **NEXUS** from your Desktop or Start Menu.
-
-> **Optional Note**: For offline local AI, install Ollama from [ollama.com](https://ollama.com); CSV ingestion, SQL Explorer, Telemetry HUD, and Cloud Gemini/Claude mode work immediately with zero extra setup.
-
-<details>
-<summary>Developer Setup & Build from Source (Optional)</summary>
+<details open>
+<summary><b>Developer Setup & Build from Source</b></summary>
 
 <br>
 
